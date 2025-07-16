@@ -1,861 +1,852 @@
 # -*- coding: utf-8 -*-
 """
-动画渲染器
+动画渲染器模块
 
-实现绘画动画的渲染和输出
-包括视频生成、帧序列导出、实时预览等功能
+提供高质量的动画渲染功能
 """
 
 import numpy as np
-import cv2
-from typing import Dict, List, Tuple, Optional, Any, Callable
+from typing import List, Dict, Any, Tuple, Optional, Union
 from dataclasses import dataclass
 import logging
+from enum import Enum
+import cv2
 import os
-import time
-import math
-import json
 from pathlib import Path
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-from matplotlib.patches import Circle, Rectangle
-from matplotlib.collections import LineCollection
-import imageio
-from PIL import Image, ImageDraw, ImageFont
-from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from .painting_animator import AnimationFrame, AnimationSequence
+from ..stroke_extraction.stroke_detector import Stroke
+
+
+class RenderFormat(Enum):
+    """渲染格式"""
+    MP4 = "mp4"
+    AVI = "avi"
+    GIF = "gif"
+    WEBM = "webm"
+    MOV = "mov"
+    FRAMES = "frames"  # 输出单独帧
+
+
+class RenderQuality(Enum):
+    """渲染质量"""
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    ULTRA = "ultra"
 
 
 @dataclass
-class RenderSettings:
-    """
-    渲染设置数据结构
-    
-    Attributes:
-        output_format (str): 输出格式
-        resolution (Tuple[int, int]): 分辨率
-        fps (int): 帧率
-        quality (str): 质量设置
-        background_color (Tuple[int, int, int]): 背景颜色
-        show_brush (bool): 显示笔刷
-        show_trajectory (bool): 显示轨迹
-        show_progress (bool): 显示进度
-        enable_effects (bool): 启用特效
-        codec (str): 编码器
-    """
-    output_format: str
-    resolution: Tuple[int, int]
-    fps: int
-    quality: str
-    background_color: Tuple[int, int, int]
-    show_brush: bool
-    show_trajectory: bool
-    show_progress: bool
-    enable_effects: bool
-    codec: str
+class RenderConfig:
+    """渲染配置"""
+    output_path: str
+    format: RenderFormat = RenderFormat.MP4
+    quality: RenderQuality = RenderQuality.HIGH
+    fps: int = 30
+    resolution: Tuple[int, int] = (1920, 1080)
+    bitrate: str = "5000k"
+    codec: str = "h264"
+    background_color: Tuple[int, int, int] = (255, 255, 255)
+    enable_antialiasing: bool = True
+    enable_motion_blur: bool = False
+    motion_blur_strength: float = 0.5
+    enable_progressive_jpeg: bool = True
+    compression_level: int = 6
+    enable_multithreading: bool = True
+    max_threads: int = 4
 
 
 @dataclass
 class RenderProgress:
-    """
-    渲染进度数据结构
-    
-    Attributes:
-        current_frame (int): 当前帧
-        total_frames (int): 总帧数
-        current_stroke (int): 当前笔画
-        total_strokes (int): 总笔画数
-        elapsed_time (float): 已用时间
-        estimated_time (float): 预计总时间
-        progress_percentage (float): 进度百分比
-        status (str): 状态
-    """
+    """渲染进度"""
     current_frame: int
     total_frames: int
-    current_stroke: int
-    total_strokes: int
     elapsed_time: float
-    estimated_time: float
-    progress_percentage: float
+    estimated_remaining: float
+    fps_actual: float
+    memory_usage: float
     status: str
 
 
+@dataclass
+class RenderResult:
+    """渲染结果"""
+    success: bool
+    output_path: str
+    total_frames: int
+    duration: float
+    file_size: int
+    average_fps: float
+    error_message: Optional[str] = None
+    warnings: List[str] = None
+
+
 class AnimationRenderer:
-    """
-    动画渲染器
+    """动画渲染器"""
     
-    渲染绘画动画为视频或图像序列
-    """
-    
-    def __init__(self, config):
+    def __init__(self, config: Dict[str, Any]):
         """
         初始化动画渲染器
         
         Args:
-            config: 配置对象
+            config: 配置参数
         """
         self.config = config
         self.logger = logging.getLogger(__name__)
         
-        # 渲染设置
-        self.default_resolution = tuple(config['rendering'].get('resolution', (1920, 1080)))
-        self.default_fps = config['rendering'].get('fps', 30)
-        self.default_quality = config['rendering'].get('quality', 'high')
-        self.default_format = config['rendering'].get('format', 'mp4')
-        self.default_codec = config['rendering'].get('codec', 'h264')
-        
-        # 视觉效果设置
-        self.show_brush = config['rendering'].get('show_brush', True)
-        self.show_trajectory = config['rendering'].get('show_trajectory', False)
-        self.show_progress = config['rendering'].get('show_progress', True)
-        self.enable_effects = config['rendering'].get('enable_effects', True)
-        
-        # 颜色设置
-        self.background_color = tuple(config['rendering'].get('background_color', (255, 255, 255)))
-        self.brush_color = tuple(config['rendering'].get('brush_color', (0, 0, 0)))
-        self.trajectory_color = tuple(config['rendering'].get('trajectory_color', (128, 128, 128)))
-        self.progress_color = tuple(config['rendering'].get('progress_color', (255, 0, 0)))
-        
-        # 字体设置
-        self.font_size = config['rendering'].get('font_size', 24)
-        self.font_path = config['rendering'].get('font_path', None)
-        
-        # 性能设置
-        self.parallel_rendering = config['rendering'].get('parallel_rendering', False)
-        self.memory_limit = config['rendering'].get('memory_limit', 2048)  # MB
-        self.temp_dir = config['rendering'].get('temp_dir', './temp')
-        
-        # 初始化
-        self._ensure_temp_dir()
-        self.current_canvas = None
-        self.render_progress = None
-    
-    def _ensure_temp_dir(self):
-        """
-        确保临时目录存在
-        """
-        try:
-            os.makedirs(self.temp_dir, exist_ok=True)
-        except Exception as e:
-            self.logger.error(f"Error creating temp directory: {str(e)}")
-    
-    def render_animation(self, painting_animation, output_path: str,
-                        render_settings: Optional[RenderSettings] = None,
-                        progress_callback: Optional[Callable] = None) -> bool:
-        """
-        渲染完整动画
-        
-        Args:
-            painting_animation: 绘画动画对象
-            output_path (str): 输出路径
-            render_settings (Optional[RenderSettings]): 渲染设置
-            progress_callback (Optional[Callable]): 进度回调函数
-            
-        Returns:
-            bool: 是否成功
-        """
-        try:
-            self.logger.info(f"Starting animation rendering to {output_path}")
-            
-            # 使用默认设置或提供的设置
-            if render_settings is None:
-                render_settings = self._create_default_render_settings()
-            
-            # 初始化渲染进度
-            self.render_progress = RenderProgress(
-                current_frame=0,
-                total_frames=len(painting_animation.all_frames),
-                current_stroke=0,
-                total_strokes=len(painting_animation.stroke_animations),
-                elapsed_time=0.0,
-                estimated_time=0.0,
-                progress_percentage=0.0,
-                status="initializing"
-            )
-            
-            start_time = time.time()
-            
-            # 根据输出格式选择渲染方法
-            if render_settings.output_format.lower() in ['mp4', 'avi', 'mov']:
-                success = self._render_video(
-                    painting_animation, output_path, render_settings, progress_callback
-                )
-            elif render_settings.output_format.lower() in ['gif']:
-                success = self._render_gif(
-                    painting_animation, output_path, render_settings, progress_callback
-                )
-            elif render_settings.output_format.lower() in ['frames', 'png_sequence']:
-                success = self._render_frame_sequence(
-                    painting_animation, output_path, render_settings, progress_callback
-                )
-            else:
-                self.logger.error(f"Unsupported output format: {render_settings.output_format}")
-                return False
-            
-            # 更新最终进度
-            if success:
-                self.render_progress.status = "completed"
-                self.render_progress.progress_percentage = 100.0
-                self.render_progress.elapsed_time = time.time() - start_time
-                
-                if progress_callback:
-                    progress_callback(self.render_progress)
-                
-                self.logger.info(f"Animation rendering completed in {self.render_progress.elapsed_time:.2f}s")
-            else:
-                self.render_progress.status = "failed"
-                if progress_callback:
-                    progress_callback(self.render_progress)
-            
-            return success
-            
-        except Exception as e:
-            self.logger.error(f"Error rendering animation: {str(e)}")
-            if self.render_progress:
-                self.render_progress.status = "error"
-                if progress_callback:
-                    progress_callback(self.render_progress)
-            return False
-    
-    def _create_default_render_settings(self) -> RenderSettings:
-        """
-        创建默认渲染设置
-        
-        Returns:
-            RenderSettings: 默认渲染设置
-        """
-        return RenderSettings(
-            output_format=self.default_format,
-            resolution=self.default_resolution,
-            fps=self.default_fps,
-            quality=self.default_quality,
-            background_color=self.background_color,
-            show_brush=self.show_brush,
-            show_trajectory=self.show_trajectory,
-            show_progress=self.show_progress,
-            enable_effects=self.enable_effects,
-            codec=self.default_codec
+        # 默认渲染配置
+        self.default_config = RenderConfig(
+            output_path=config.get('output_path', 'output.mp4'),
+            format=RenderFormat(config.get('format', 'mp4')),
+            quality=RenderQuality(config.get('quality', 'high')),
+            fps=config.get('fps', 30),
+            resolution=tuple(config.get('resolution', [1920, 1080])),
+            bitrate=config.get('bitrate', '5000k'),
+            codec=config.get('codec', 'h264'),
+            background_color=tuple(config.get('background_color', [255, 255, 255])),
+            enable_antialiasing=config.get('enable_antialiasing', True),
+            enable_motion_blur=config.get('enable_motion_blur', False),
+            motion_blur_strength=config.get('motion_blur_strength', 0.5),
+            enable_multithreading=config.get('enable_multithreading', True),
+            max_threads=config.get('max_threads', 4)
         )
-    
-    def _render_video(self, painting_animation, output_path: str,
-                     render_settings: RenderSettings,
-                     progress_callback: Optional[Callable] = None) -> bool:
+        
+        # 渲染状态
+        self.is_rendering = False
+        self.current_progress = None
+        self.render_lock = threading.Lock()
+        
+        # 性能优化
+        self.frame_cache = {}
+        self.enable_frame_caching = config.get('enable_frame_caching', True)
+        self.max_cache_size = config.get('max_cache_size', 100)
+        
+        # 质量设置映射
+        self.quality_settings = {
+            RenderQuality.LOW: {
+                'crf': 28,
+                'preset': 'ultrafast',
+                'scale_factor': 0.5
+            },
+            RenderQuality.MEDIUM: {
+                'crf': 23,
+                'preset': 'fast',
+                'scale_factor': 0.75
+            },
+            RenderQuality.HIGH: {
+                'crf': 18,
+                'preset': 'medium',
+                'scale_factor': 1.0
+            },
+            RenderQuality.ULTRA: {
+                'crf': 15,
+                'preset': 'slow',
+                'scale_factor': 1.0
+            }
+        }
+        
+    def render_animation(self, animation_sequence: AnimationSequence, 
+                        render_config: RenderConfig = None,
+                        progress_callback: callable = None) -> RenderResult:
         """
-        渲染视频
+        渲染动画序列
         
         Args:
-            painting_animation: 绘画动画对象
-            output_path (str): 输出路径
-            render_settings (RenderSettings): 渲染设置
-            progress_callback (Optional[Callable]): 进度回调
+            animation_sequence: 动画序列
+            render_config: 渲染配置
+            progress_callback: 进度回调函数
             
         Returns:
-            bool: 是否成功
+            渲染结果
         """
-        try:
-            # 设置视频编码器
-            fourcc = self._get_fourcc(render_settings.codec)
+        with self.render_lock:
+            if self.is_rendering:
+                return RenderResult(
+                    success=False,
+                    output_path="",
+                    total_frames=0,
+                    duration=0,
+                    file_size=0,
+                    average_fps=0,
+                    error_message="Another rendering is in progress"
+                )
             
-            # 创建视频写入器
-            video_writer = cv2.VideoWriter(
-                output_path,
-                fourcc,
-                render_settings.fps,
-                render_settings.resolution
+            self.is_rendering = True
+        
+        try:
+            config = render_config or self.default_config
+            
+            # 验证配置
+            validation_result = self._validate_config(config)
+            if not validation_result[0]:
+                return RenderResult(
+                    success=False,
+                    output_path="",
+                    total_frames=0,
+                    duration=0,
+                    file_size=0,
+                    average_fps=0,
+                    error_message=validation_result[1]
+                )
+            
+            # 准备输出目录
+            output_dir = os.path.dirname(config.output_path)
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir, exist_ok=True)
+            
+            # 根据格式选择渲染方法
+            if config.format == RenderFormat.FRAMES:
+                return self._render_frames(animation_sequence, config, progress_callback)
+            elif config.format == RenderFormat.GIF:
+                return self._render_gif(animation_sequence, config, progress_callback)
+            else:
+                return self._render_video(animation_sequence, config, progress_callback)
+                
+        except Exception as e:
+            self.logger.error(f"Error rendering animation: {e}")
+            return RenderResult(
+                success=False,
+                output_path="",
+                total_frames=0,
+                duration=0,
+                file_size=0,
+                average_fps=0,
+                error_message=str(e)
             )
-            
-            if not video_writer.isOpened():
-                self.logger.error("Failed to open video writer")
-                return False
-            
-            # 初始化画布
-            self.current_canvas = self._create_canvas(render_settings)
-            
-            # 渲染每一帧
-            self.render_progress.status = "rendering"
-            
-            for frame_idx, frame in enumerate(tqdm(painting_animation.all_frames, desc="Rendering frames")):
-                # 更新进度
-                self.render_progress.current_frame = frame_idx
-                self.render_progress.progress_percentage = (frame_idx / len(painting_animation.all_frames)) * 100
-                
-                if progress_callback and frame_idx % 10 == 0:  # 每10帧更新一次进度
-                    progress_callback(self.render_progress)
-                
-                # 渲染当前帧
-                frame_image = self._render_frame(
-                    frame, painting_animation, render_settings
-                )
-                
-                # 写入视频
-                video_writer.write(frame_image)
-            
-            # 释放资源
-            video_writer.release()
-            
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error rendering video: {str(e)}")
-            return False
+        finally:
+            self.is_rendering = False
     
-    def _render_gif(self, painting_animation, output_path: str,
-                   render_settings: RenderSettings,
-                   progress_callback: Optional[Callable] = None) -> bool:
-        """
-        渲染GIF动画
-        
-        Args:
-            painting_animation: 绘画动画对象
-            output_path (str): 输出路径
-            render_settings (RenderSettings): 渲染设置
-            progress_callback (Optional[Callable]): 进度回调
-            
-        Returns:
-            bool: 是否成功
-        """
-        try:
-            frames = []
-            
-            # 初始化画布
-            self.current_canvas = self._create_canvas(render_settings)
-            
-            # 渲染每一帧
-            self.render_progress.status = "rendering"
-            
-            for frame_idx, frame in enumerate(tqdm(painting_animation.all_frames, desc="Rendering GIF frames")):
-                # 更新进度
-                self.render_progress.current_frame = frame_idx
-                self.render_progress.progress_percentage = (frame_idx / len(painting_animation.all_frames)) * 100
-                
-                if progress_callback and frame_idx % 10 == 0:
-                    progress_callback(self.render_progress)
-                
-                # 渲染当前帧
-                frame_image = self._render_frame(
-                    frame, painting_animation, render_settings
-                )
-                
-                # 转换为PIL图像
-                pil_image = Image.fromarray(cv2.cvtColor(frame_image, cv2.COLOR_BGR2RGB))
-                frames.append(pil_image)
-            
-            # 保存GIF
-            if frames:
-                duration = int(1000 / render_settings.fps)  # 毫秒
-                frames[0].save(
-                    output_path,
-                    save_all=True,
-                    append_images=frames[1:],
-                    duration=duration,
-                    loop=0
-                )
-            
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error rendering GIF: {str(e)}")
-            return False
-    
-    def _render_frame_sequence(self, painting_animation, output_path: str,
-                              render_settings: RenderSettings,
-                              progress_callback: Optional[Callable] = None) -> bool:
-        """
-        渲染帧序列
-        
-        Args:
-            painting_animation: 绘画动画对象
-            output_path (str): 输出目录路径
-            render_settings (RenderSettings): 渲染设置
-            progress_callback (Optional[Callable]): 进度回调
-            
-        Returns:
-            bool: 是否成功
-        """
-        try:
-            # 创建输出目录
-            os.makedirs(output_path, exist_ok=True)
-            
-            # 初始化画布
-            self.current_canvas = self._create_canvas(render_settings)
-            
-            # 渲染每一帧
-            self.render_progress.status = "rendering"
-            
-            for frame_idx, frame in enumerate(tqdm(painting_animation.all_frames, desc="Rendering frame sequence")):
-                # 更新进度
-                self.render_progress.current_frame = frame_idx
-                self.render_progress.progress_percentage = (frame_idx / len(painting_animation.all_frames)) * 100
-                
-                if progress_callback and frame_idx % 10 == 0:
-                    progress_callback(self.render_progress)
-                
-                # 渲染当前帧
-                frame_image = self._render_frame(
-                    frame, painting_animation, render_settings
-                )
-                
-                # 保存帧图像
-                frame_filename = f"frame_{frame_idx:06d}.png"
-                frame_path = os.path.join(output_path, frame_filename)
-                cv2.imwrite(frame_path, frame_image)
-            
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error rendering frame sequence: {str(e)}")
-            return False
-    
-    def _render_frame(self, frame, painting_animation, render_settings: RenderSettings) -> np.ndarray:
+    def render_frame(self, frame: AnimationFrame, config: RenderConfig = None) -> np.ndarray:
         """
         渲染单个帧
         
         Args:
-            frame: 动画帧对象
-            painting_animation: 绘画动画对象
-            render_settings (RenderSettings): 渲染设置
+            frame: 动画帧
+            config: 渲染配置
             
         Returns:
-            np.ndarray: 渲染后的帧图像
+            渲染后的图像
         """
+        config = config or self.default_config
+        
         try:
-            # 复制当前画布
-            frame_canvas = self.current_canvas.copy()
+            # 检查缓存
+            cache_key = self._get_frame_cache_key(frame, config)
+            if self.enable_frame_caching and cache_key in self.frame_cache:
+                return self.frame_cache[cache_key].copy()
             
-            # 获取当前笔画
-            current_stroke_id = frame.metadata.get('stroke_id', -1)
-            current_stroke = None
+            # 如果frame有canvas_state属性，直接使用它
+            if hasattr(frame, 'canvas_state') and frame.canvas_state is not None:
+                canvas = frame.canvas_state.copy()
+                # 应用后处理效果
+                canvas = self._apply_post_processing(canvas, config)
+            else:
+                # 创建画布
+                canvas = self._create_canvas(config)
+                
+                # 如果有active_strokes，尝试渲染（这需要额外的笔触数据）
+                # 由于AnimationFrame不包含完整的笔触数据，这里只返回基础画布
+                if hasattr(frame, 'active_strokes') and frame.active_strokes:
+                    # 这里可以添加基于active_strokes的渲染逻辑
+                    # 但需要额外的笔触数据源
+                    pass
+                
+                # 应用后处理效果
+                canvas = self._apply_post_processing(canvas, config)
             
-            for stroke_anim in painting_animation.stroke_animations:
-                if stroke_anim.stroke_id == current_stroke_id:
-                    current_stroke = stroke_anim
-                    break
+            # 缓存结果
+            if self.enable_frame_caching:
+                self._cache_frame(cache_key, canvas)
             
-            # 渲染已完成的笔画
-            self._render_completed_strokes(
-                frame_canvas, painting_animation, frame.timestamp, render_settings
-            )
-            
-            # 渲染当前笔画进度
-            if current_stroke:
-                self._render_current_stroke_progress(
-                    frame_canvas, current_stroke, frame, render_settings
-                )
-            
-            # 渲染笔刷
-            if render_settings.show_brush:
-                self._render_brush(
-                    frame_canvas, frame, render_settings
-                )
-            
-            # 渲染轨迹
-            if render_settings.show_trajectory and current_stroke:
-                self._render_trajectory(
-                    frame_canvas, current_stroke, frame, render_settings
-                )
-            
-            # 渲染进度信息
-            if render_settings.show_progress:
-                self._render_progress_info(
-                    frame_canvas, frame, painting_animation, render_settings
-                )
-            
-            # 应用特效
-            if render_settings.enable_effects:
-                frame_canvas = self._apply_effects(frame_canvas, frame, render_settings)
-            
-            return frame_canvas
+            return canvas
             
         except Exception as e:
-            self.logger.error(f"Error rendering frame: {str(e)}")
-            return self.current_canvas.copy()
+            self.logger.error(f"Error rendering frame: {e}")
+            return self._create_canvas(config)
     
-    def _create_canvas(self, render_settings: RenderSettings) -> np.ndarray:
+    def _render_video(self, animation_sequence: AnimationSequence, 
+                     config: RenderConfig, progress_callback: callable) -> RenderResult:
+        """
+        渲染视频
+        
+        Args:
+            animation_sequence: 动画序列
+            config: 渲染配置
+            progress_callback: 进度回调
+            
+        Returns:
+            渲染结果
+        """
+        import time
+        start_time = time.time()
+        
+        # 设置视频编写器
+        fourcc = self._get_fourcc(config.codec)
+        quality_settings = self.quality_settings[config.quality]
+        
+        # 调整分辨率
+        actual_resolution = (
+            int(config.resolution[0] * quality_settings['scale_factor']),
+            int(config.resolution[1] * quality_settings['scale_factor'])
+        )
+        
+        video_writer = cv2.VideoWriter(
+            config.output_path,
+            fourcc,
+            config.fps,
+            actual_resolution
+        )
+        
+        if not video_writer.isOpened():
+            return RenderResult(
+                success=False,
+                output_path="",
+                total_frames=0,
+                duration=0,
+                file_size=0,
+                average_fps=0,
+                error_message="Failed to open video writer"
+            )
+        
+        total_frames = len(animation_sequence.frames)
+        warnings = []
+        
+        try:
+            # 渲染帧
+            if config.enable_multithreading and total_frames > 10:
+                # 多线程渲染
+                rendered_frames = self._render_frames_parallel(
+                    animation_sequence.frames, config, progress_callback
+                )
+            else:
+                # 单线程渲染
+                rendered_frames = self._render_frames_sequential(
+                    animation_sequence.frames, config, progress_callback
+                )
+            
+            # 写入视频
+            for i, frame_image in enumerate(rendered_frames):
+                if frame_image is None:
+                    warnings.append(f"Frame {i} failed to render")
+                    frame_image = self._create_canvas(config)
+                
+                # 调整帧大小
+                current_resolution = (frame_image.shape[1], frame_image.shape[0])  # (width, height)
+                if current_resolution != tuple(actual_resolution):
+                    frame_image = cv2.resize(frame_image, actual_resolution)
+                
+                # 应用运动模糊
+                if config.enable_motion_blur and i > 0:
+                    frame_image = self._apply_motion_blur(
+                        frame_image, rendered_frames[i-1], config.motion_blur_strength
+                    )
+                
+                video_writer.write(frame_image)
+                
+                # 更新进度
+                if progress_callback:
+                    progress = RenderProgress(
+                        current_frame=i + 1,
+                        total_frames=total_frames,
+                        elapsed_time=time.time() - start_time,
+                        estimated_remaining=0,  # 计算剩余时间
+                        fps_actual=0,  # 计算实际FPS
+                        memory_usage=0,  # 计算内存使用
+                        status="Writing video"
+                    )
+                    progress_callback(progress)
+            
+            video_writer.release()
+            
+            # 计算结果统计
+            end_time = time.time()
+            duration = end_time - start_time
+            file_size = os.path.getsize(config.output_path) if os.path.exists(config.output_path) else 0
+            average_fps = total_frames / duration if duration > 0 else 0
+            
+            return RenderResult(
+                success=True,
+                output_path=config.output_path,
+                total_frames=total_frames,
+                duration=duration,
+                file_size=file_size,
+                average_fps=average_fps,
+                warnings=warnings if warnings else None
+            )
+            
+        except Exception as e:
+            video_writer.release()
+            raise e
+    
+    def _render_gif(self, animation_sequence: AnimationSequence, 
+                   config: RenderConfig, progress_callback: callable) -> RenderResult:
+        """
+        渲染GIF
+        
+        Args:
+            animation_sequence: 动画序列
+            config: 渲染配置
+            progress_callback: 进度回调
+            
+        Returns:
+            渲染结果
+        """
+        try:
+            from PIL import Image
+        except ImportError:
+            return RenderResult(
+                success=False,
+                output_path="",
+                total_frames=0,
+                duration=0,
+                file_size=0,
+                average_fps=0,
+                error_message="PIL is required for GIF rendering"
+            )
+        
+        import time
+        start_time = time.time()
+        
+        total_frames = len(animation_sequence.frames)
+        pil_images = []
+        
+        # 渲染所有帧
+        for i, frame in enumerate(animation_sequence.frames):
+            # 渲染帧
+            frame_image = self.render_frame(frame, config)
+            
+            # 转换为PIL图像
+            frame_rgb = cv2.cvtColor(frame_image, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(frame_rgb)
+            
+            # 优化GIF大小
+            if config.quality != RenderQuality.ULTRA:
+                # 减少颜色数量
+                pil_image = pil_image.quantize(colors=256)
+            
+            pil_images.append(pil_image)
+            
+            # 更新进度
+            if progress_callback:
+                progress = RenderProgress(
+                    current_frame=i + 1,
+                    total_frames=total_frames,
+                    elapsed_time=time.time() - start_time,
+                    estimated_remaining=0,
+                    fps_actual=0,
+                    memory_usage=0,
+                    status="Rendering GIF frames"
+                )
+                progress_callback(progress)
+        
+        # 保存GIF
+        if pil_images:
+            duration_per_frame = int(1000 / config.fps)  # 毫秒
+            
+            pil_images[0].save(
+                config.output_path,
+                save_all=True,
+                append_images=pil_images[1:],
+                duration=duration_per_frame,
+                loop=0,
+                optimize=True
+            )
+        
+        # 计算结果统计
+        end_time = time.time()
+        duration = end_time - start_time
+        file_size = os.path.getsize(config.output_path) if os.path.exists(config.output_path) else 0
+        average_fps = total_frames / duration if duration > 0 else 0
+        
+        return RenderResult(
+            success=True,
+            output_path=config.output_path,
+            total_frames=total_frames,
+            duration=duration,
+            file_size=file_size,
+            average_fps=average_fps
+        )
+    
+    def _render_frames(self, animation_sequence: AnimationSequence, 
+                      config: RenderConfig, progress_callback: callable) -> RenderResult:
+        """
+        渲染单独帧
+        
+        Args:
+            animation_sequence: 动画序列
+            config: 渲染配置
+            progress_callback: 进度回调
+            
+        Returns:
+            渲染结果
+        """
+        import time
+        start_time = time.time()
+        
+        # 创建输出目录
+        output_dir = config.output_path
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+        
+        total_frames = len(animation_sequence.frames)
+        
+        # 渲染每一帧
+        for i, frame in enumerate(animation_sequence.frames):
+            # 渲染帧
+            frame_image = self.render_frame(frame, config)
+            
+            # 保存帧
+            frame_filename = f"frame_{i:06d}.png"
+            frame_path = os.path.join(output_dir, frame_filename)
+            cv2.imwrite(frame_path, frame_image)
+            
+            # 更新进度
+            if progress_callback:
+                progress = RenderProgress(
+                    current_frame=i + 1,
+                    total_frames=total_frames,
+                    elapsed_time=time.time() - start_time,
+                    estimated_remaining=0,
+                    fps_actual=0,
+                    memory_usage=0,
+                    status="Saving frames"
+                )
+                progress_callback(progress)
+        
+        # 计算结果统计
+        end_time = time.time()
+        duration = end_time - start_time
+        
+        # 计算总文件大小
+        total_size = 0
+        for filename in os.listdir(output_dir):
+            if filename.startswith("frame_") and filename.endswith(".png"):
+                total_size += os.path.getsize(os.path.join(output_dir, filename))
+        
+        average_fps = total_frames / duration if duration > 0 else 0
+        
+        return RenderResult(
+            success=True,
+            output_path=output_dir,
+            total_frames=total_frames,
+            duration=duration,
+            file_size=total_size,
+            average_fps=average_fps
+        )
+    
+    def _render_frames_parallel(self, frames: List[AnimationFrame], 
+                               config: RenderConfig, progress_callback: callable) -> List[np.ndarray]:
+        """
+        并行渲染帧
+        
+        Args:
+            frames: 帧列表
+            config: 渲染配置
+            progress_callback: 进度回调
+            
+        Returns:
+            渲染后的图像列表
+        """
+        rendered_frames = [None] * len(frames)
+        
+        with ThreadPoolExecutor(max_workers=config.max_threads) as executor:
+            # 提交渲染任务
+            future_to_index = {
+                executor.submit(self.render_frame, frame, config): i 
+                for i, frame in enumerate(frames)
+            }
+            
+            # 收集结果
+            completed = 0
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    rendered_frames[index] = future.result()
+                except Exception as e:
+                    self.logger.error(f"Error rendering frame {index}: {e}")
+                    rendered_frames[index] = None
+                
+                completed += 1
+                
+                # 更新进度
+                if progress_callback:
+                    progress = RenderProgress(
+                        current_frame=completed,
+                        total_frames=len(frames),
+                        elapsed_time=0,
+                        estimated_remaining=0,
+                        fps_actual=0,
+                        memory_usage=0,
+                        status="Rendering frames"
+                    )
+                    progress_callback(progress)
+        
+        return rendered_frames
+    
+    def _render_frames_sequential(self, frames: List[AnimationFrame], 
+                                 config: RenderConfig, progress_callback: callable) -> List[np.ndarray]:
+        """
+        顺序渲染帧
+        
+        Args:
+            frames: 帧列表
+            config: 渲染配置
+            progress_callback: 进度回调
+            
+        Returns:
+            渲染后的图像列表
+        """
+        rendered_frames = []
+        
+        for i, frame in enumerate(frames):
+            try:
+                rendered_frame = self.render_frame(frame, config)
+                rendered_frames.append(rendered_frame)
+            except Exception as e:
+                self.logger.error(f"Error rendering frame {i}: {e}")
+                rendered_frames.append(None)
+            
+            # 更新进度
+            if progress_callback:
+                progress = RenderProgress(
+                    current_frame=i + 1,
+                    total_frames=len(frames),
+                    elapsed_time=0,
+                    estimated_remaining=0,
+                    fps_actual=0,
+                    memory_usage=0,
+                    status="Rendering frames"
+                )
+                progress_callback(progress)
+        
+        return rendered_frames
+    
+    def _create_canvas(self, config: RenderConfig) -> np.ndarray:
         """
         创建画布
         
         Args:
-            render_settings (RenderSettings): 渲染设置
+            config: 渲染配置
             
         Returns:
-            np.ndarray: 画布图像
+            画布图像
         """
-        try:
-            width, height = render_settings.resolution
-            canvas = np.full((height, width, 3), render_settings.background_color, dtype=np.uint8)
-            
-            return canvas
-            
-        except Exception as e:
-            self.logger.error(f"Error creating canvas: {str(e)}")
-            return np.full((600, 800, 3), (255, 255, 255), dtype=np.uint8)
+        quality_settings = self.quality_settings[config.quality]
+        actual_resolution = (
+            int(config.resolution[1] * quality_settings['scale_factor']),  # height
+            int(config.resolution[0] * quality_settings['scale_factor']),  # width
+            3  # channels
+        )
+        
+        canvas = np.full(actual_resolution, config.background_color, dtype=np.uint8)
+        return canvas
     
-    def _render_completed_strokes(self, canvas: np.ndarray, painting_animation,
-                                 current_time: float, render_settings: RenderSettings):
+    def _render_stroke_on_canvas(self, canvas: np.ndarray, stroke_data: Dict[str, Any], 
+                                config: RenderConfig) -> np.ndarray:
         """
-        渲染已完成的笔画
+        在画布上渲染笔触
         
         Args:
-            canvas (np.ndarray): 画布
-            painting_animation: 绘画动画对象
-            current_time (float): 当前时间
-            render_settings (RenderSettings): 渲染设置
-        """
-        try:
-            for stroke_anim in painting_animation.stroke_animations:
-                stroke_start_time = stroke_anim.metadata.get('start_time', 0.0)
-                stroke_end_time = stroke_start_time + stroke_anim.duration
-                
-                if current_time >= stroke_end_time:
-                    # 渲染完整笔画
-                    self._render_complete_stroke(canvas, stroke_anim, render_settings)
-                elif current_time > stroke_start_time:
-                    # 渲染部分笔画
-                    progress = (current_time - stroke_start_time) / stroke_anim.duration
-                    self._render_partial_stroke(canvas, stroke_anim, progress, render_settings)
-            
-        except Exception as e:
-            self.logger.error(f"Error rendering completed strokes: {str(e)}")
-    
-    def _render_complete_stroke(self, canvas: np.ndarray, stroke_anim, render_settings: RenderSettings):
-        """
-        渲染完整笔画
-        
-        Args:
-            canvas (np.ndarray): 画布
-            stroke_anim: 笔画动画对象
-            render_settings (RenderSettings): 渲染设置
-        """
-        try:
-            trajectory = stroke_anim.trajectory
-            brush_sizes = stroke_anim.brush_size_curve
-            
-            # 渲染笔画路径
-            for i in range(len(trajectory) - 1):
-                start_pos = trajectory[i]
-                end_pos = trajectory[i + 1]
-                brush_size = brush_sizes[i] if i < len(brush_sizes) else 5
-                
-                # 绘制线段
-                cv2.line(
-                    canvas,
-                    (int(start_pos[0]), int(start_pos[1])),
-                    (int(end_pos[0]), int(end_pos[1])),
-                    self.brush_color,
-                    max(1, int(brush_size))
-                )
-            
-        except Exception as e:
-            self.logger.error(f"Error rendering complete stroke: {str(e)}")
-    
-    def _render_partial_stroke(self, canvas: np.ndarray, stroke_anim, progress: float, render_settings: RenderSettings):
-        """
-        渲染部分笔画
-        
-        Args:
-            canvas (np.ndarray): 画布
-            stroke_anim: 笔画动画对象
-            progress (float): 进度（0-1）
-            render_settings (RenderSettings): 渲染设置
-        """
-        try:
-            trajectory = stroke_anim.trajectory
-            brush_sizes = stroke_anim.brush_size_curve
-            
-            # 计算要渲染的点数
-            num_points = int(len(trajectory) * progress)
-            
-            # 渲染部分路径
-            for i in range(min(num_points - 1, len(trajectory) - 1)):
-                start_pos = trajectory[i]
-                end_pos = trajectory[i + 1]
-                brush_size = brush_sizes[i] if i < len(brush_sizes) else 5
-                
-                # 绘制线段
-                cv2.line(
-                    canvas,
-                    (int(start_pos[0]), int(start_pos[1])),
-                    (int(end_pos[0]), int(end_pos[1])),
-                    self.brush_color,
-                    max(1, int(brush_size))
-                )
-            
-        except Exception as e:
-            self.logger.error(f"Error rendering partial stroke: {str(e)}")
-    
-    def _render_current_stroke_progress(self, canvas: np.ndarray, stroke_anim, frame, render_settings: RenderSettings):
-        """
-        渲染当前笔画进度
-        
-        Args:
-            canvas (np.ndarray): 画布
-            stroke_anim: 笔画动画对象
-            frame: 动画帧对象
-            render_settings (RenderSettings): 渲染设置
-        """
-        try:
-            # 基于帧的进度渲染当前笔画
-            progress = frame.stroke_progress
-            self._render_partial_stroke(canvas, stroke_anim, progress, render_settings)
-            
-        except Exception as e:
-            self.logger.error(f"Error rendering current stroke progress: {str(e)}")
-    
-    def _render_brush(self, canvas: np.ndarray, frame, render_settings: RenderSettings):
-        """
-        渲染笔刷
-        
-        Args:
-            canvas (np.ndarray): 画布
-            frame: 动画帧对象
-            render_settings (RenderSettings): 渲染设置
-        """
-        try:
-            x, y = int(frame.brush_position[0]), int(frame.brush_position[1])
-            size = int(frame.brush_size)
-            
-            # 绘制笔刷圆圈
-            cv2.circle(canvas, (x, y), size, self.brush_color, 2)
-            
-            # 绘制笔刷中心点
-            cv2.circle(canvas, (x, y), 2, self.progress_color, -1)
-            
-        except Exception as e:
-            self.logger.error(f"Error rendering brush: {str(e)}")
-    
-    def _render_trajectory(self, canvas: np.ndarray, stroke_anim, frame, render_settings: RenderSettings):
-        """
-        渲染轨迹
-        
-        Args:
-            canvas (np.ndarray): 画布
-            stroke_anim: 笔画动画对象
-            frame: 动画帧对象
-            render_settings (RenderSettings): 渲染设置
-        """
-        try:
-            trajectory = stroke_anim.trajectory
-            
-            # 绘制轨迹线
-            points = np.array([(int(p[0]), int(p[1])) for p in trajectory], dtype=np.int32)
-            if len(points) > 1:
-                cv2.polylines(canvas, [points], False, self.trajectory_color, 1)
-            
-            # 标记当前位置
-            current_pos = frame.brush_position
-            cv2.circle(canvas, (int(current_pos[0]), int(current_pos[1])), 3, self.progress_color, -1)
-            
-        except Exception as e:
-            self.logger.error(f"Error rendering trajectory: {str(e)}")
-    
-    def _render_progress_info(self, canvas: np.ndarray, frame, painting_animation, render_settings: RenderSettings):
-        """
-        渲染进度信息
-        
-        Args:
-            canvas (np.ndarray): 画布
-            frame: 动画帧对象
-            painting_animation: 绘画动画对象
-            render_settings (RenderSettings): 渲染设置
-        """
-        try:
-            # 计算进度
-            total_duration = painting_animation.total_duration
-            current_time = frame.timestamp
-            progress_percentage = (current_time / total_duration) * 100 if total_duration > 0 else 0
-            
-            # 当前笔画信息
-            current_stroke_id = frame.metadata.get('stroke_id', 0)
-            total_strokes = len(painting_animation.stroke_animations)
-            
-            # 渲染进度条
-            bar_width = 300
-            bar_height = 20
-            bar_x = 50
-            bar_y = 50
-            
-            # 背景
-            cv2.rectangle(canvas, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (200, 200, 200), -1)
-            
-            # 进度
-            progress_width = int(bar_width * progress_percentage / 100)
-            cv2.rectangle(canvas, (bar_x, bar_y), (bar_x + progress_width, bar_y + bar_height), self.progress_color, -1)
-            
-            # 边框
-            cv2.rectangle(canvas, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (0, 0, 0), 2)
-            
-            # 文字信息
-            text = f"Progress: {progress_percentage:.1f}% | Stroke: {current_stroke_id + 1}/{total_strokes}"
-            cv2.putText(canvas, text, (bar_x, bar_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
-            
-            # 时间信息
-            time_text = f"Time: {current_time:.1f}s / {total_duration:.1f}s"
-            cv2.putText(canvas, time_text, (bar_x, bar_y + bar_height + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-            
-        except Exception as e:
-            self.logger.error(f"Error rendering progress info: {str(e)}")
-    
-    def _apply_effects(self, canvas: np.ndarray, frame, render_settings: RenderSettings) -> np.ndarray:
-        """
-        应用视觉特效
-        
-        Args:
-            canvas (np.ndarray): 画布
-            frame: 动画帧对象
-            render_settings (RenderSettings): 渲染设置
+            canvas: 画布
+            stroke_data: 笔触数据
+            config: 渲染配置
             
         Returns:
-            np.ndarray: 应用特效后的画布
+            更新后的画布
         """
-        try:
-            # 添加轻微的模糊效果模拟墨水扩散
-            if frame.ink_flow > 0.7:
-                kernel_size = max(1, int(frame.ink_flow * 3))
-                if kernel_size % 2 == 0:
-                    kernel_size += 1
-                canvas = cv2.GaussianBlur(canvas, (kernel_size, kernel_size), 0.5)
+        # 这里应该调用笔刷模拟器来渲染笔触
+        # 为了简化，这里只是绘制简单的线条
+        
+        if 'points' in stroke_data and len(stroke_data['points']) > 1:
+            points = stroke_data['points']
+            color = stroke_data.get('color', (0, 0, 0))
+            thickness = stroke_data.get('thickness', 2)
             
-            # 添加纸张纹理效果
-            if hasattr(self, 'paper_texture') and self.paper_texture is not None:
-                # 混合纸张纹理
-                alpha = 0.1
-                canvas = cv2.addWeighted(canvas, 1 - alpha, self.paper_texture, alpha, 0)
+            # 绘制线条
+            for i in range(len(points) - 1):
+                pt1 = (int(points[i][0]), int(points[i][1]))
+                pt2 = (int(points[i+1][0]), int(points[i+1][1]))
+                
+                if config.enable_antialiasing:
+                    cv2.line(canvas, pt1, pt2, color, thickness, cv2.LINE_AA)
+                else:
+                    cv2.line(canvas, pt1, pt2, color, thickness)
+        
+        return canvas
+    
+    def _apply_post_processing(self, image: np.ndarray, config: RenderConfig) -> np.ndarray:
+        """
+        应用后处理效果
+        
+        Args:
+            image: 输入图像
+            config: 渲染配置
             
-            return canvas
+        Returns:
+            处理后的图像
+        """
+        result = image.copy()
+        
+        # 抗锯齿
+        if config.enable_antialiasing and config.quality in [RenderQuality.HIGH, RenderQuality.ULTRA]:
+            result = cv2.GaussianBlur(result, (3, 3), 0.5)
+        
+        return result
+    
+    def _apply_motion_blur(self, current_frame: np.ndarray, previous_frame: np.ndarray, 
+                          strength: float) -> np.ndarray:
+        """
+        应用运动模糊
+        
+        Args:
+            current_frame: 当前帧
+            previous_frame: 前一帧
+            strength: 模糊强度
             
-        except Exception as e:
-            self.logger.error(f"Error applying effects: {str(e)}")
-            return canvas
+        Returns:
+            应用运动模糊后的帧
+        """
+        if previous_frame is None:
+            return current_frame
+        
+        # 简单的运动模糊实现
+        alpha = 1.0 - strength
+        blurred = cv2.addWeighted(current_frame, alpha, previous_frame, strength, 0)
+        return blurred
     
     def _get_fourcc(self, codec: str) -> int:
         """
         获取视频编码器
         
         Args:
-            codec (str): 编码器名称
+            codec: 编码器名称
             
         Returns:
-            int: OpenCV fourcc代码
+            FourCC代码
         """
         codec_map = {
             'h264': cv2.VideoWriter_fourcc(*'H264'),
             'xvid': cv2.VideoWriter_fourcc(*'XVID'),
             'mjpg': cv2.VideoWriter_fourcc(*'MJPG'),
-            'mp4v': cv2.VideoWriter_fourcc(*'mp4v')
+            'mp4v': cv2.VideoWriter_fourcc(*'MP4V')
         }
         
-        return codec_map.get(codec.lower(), cv2.VideoWriter_fourcc(*'mp4v'))
+        return codec_map.get(codec.lower(), cv2.VideoWriter_fourcc(*'H264'))
     
-    def create_preview_frame(self, painting_animation, frame_index: int,
-                           render_settings: Optional[RenderSettings] = None) -> np.ndarray:
+    def _validate_config(self, config: RenderConfig) -> Tuple[bool, str]:
         """
-        创建预览帧
+        验证渲染配置
         
         Args:
-            painting_animation: 绘画动画对象
-            frame_index (int): 帧索引
-            render_settings (Optional[RenderSettings]): 渲染设置
+            config: 渲染配置
             
         Returns:
-            np.ndarray: 预览帧图像
+            (是否有效, 错误信息)
         """
-        try:
-            if render_settings is None:
-                render_settings = self._create_default_render_settings()
-            
-            if frame_index < 0 or frame_index >= len(painting_animation.all_frames):
-                return self._create_canvas(render_settings)
-            
-            # 初始化画布
-            self.current_canvas = self._create_canvas(render_settings)
-            
-            # 渲染指定帧
-            frame = painting_animation.all_frames[frame_index]
-            preview_frame = self._render_frame(frame, painting_animation, render_settings)
-            
-            return preview_frame
-            
-        except Exception as e:
-            self.logger.error(f"Error creating preview frame: {str(e)}")
-            return self._create_canvas(render_settings or self._create_default_render_settings())
+        if config.fps <= 0:
+            return False, "FPS must be positive"
+        
+        if config.resolution[0] <= 0 or config.resolution[1] <= 0:
+            return False, "Resolution must be positive"
+        
+        if not config.output_path:
+            return False, "Output path is required"
+        
+        # 检查输出目录是否可写
+        output_dir = os.path.dirname(config.output_path)
+        if output_dir and not os.access(output_dir, os.W_OK):
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+            except Exception:
+                return False, f"Cannot write to output directory: {output_dir}"
+        
+        return True, ""
     
-    def export_thumbnail(self, painting_animation, output_path: str,
-                        size: Tuple[int, int] = (300, 200)) -> bool:
+    def _get_frame_cache_key(self, frame: AnimationFrame, config: RenderConfig) -> str:
         """
-        导出缩略图
+        生成帧缓存键
         
         Args:
-            painting_animation: 绘画动画对象
-            output_path (str): 输出路径
-            size (Tuple[int, int]): 缩略图大小
+            frame: 动画帧
+            config: 渲染配置
             
         Returns:
-            bool: 是否成功
+            缓存键
         """
-        try:
-            # 选择中间帧作为缩略图
-            frame_index = len(painting_animation.all_frames) // 2
-            
-            # 创建渲染设置
-            render_settings = RenderSettings(
-                output_format='png',
-                resolution=size,
-                fps=30,
-                quality='medium',
-                background_color=self.background_color,
-                show_brush=False,
-                show_trajectory=False,
-                show_progress=False,
-                enable_effects=True,
-                codec='png'
-            )
-            
-            # 渲染缩略图
-            thumbnail = self.create_preview_frame(painting_animation, frame_index, render_settings)
-            
-            # 保存缩略图
-            cv2.imwrite(output_path, thumbnail)
-            
-            self.logger.info(f"Thumbnail exported to {output_path}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error exporting thumbnail: {str(e)}")
-            return False
+        # 简化的缓存键生成
+        key_parts = [
+            str(frame.timestamp),
+            str(len(frame.active_strokes) if hasattr(frame, 'active_strokes') and frame.active_strokes else 0),
+            str(config.resolution),
+            str(config.quality.value)
+        ]
+        return "_".join(key_parts)
     
-    def get_render_statistics(self) -> Dict[str, Any]:
+    def _cache_frame(self, cache_key: str, frame_image: np.ndarray):
         """
-        获取渲染统计信息
+        缓存帧
+        
+        Args:
+            cache_key: 缓存键
+            frame_image: 帧图像
+        """
+        if len(self.frame_cache) >= self.max_cache_size:
+            # 移除最旧的缓存项
+            oldest_key = next(iter(self.frame_cache))
+            del self.frame_cache[oldest_key]
+        
+        self.frame_cache[cache_key] = frame_image.copy()
+    
+    def get_render_progress(self) -> Optional[RenderProgress]:
+        """
+        获取当前渲染进度
         
         Returns:
-            Dict[str, Any]: 统计信息
+            渲染进度
         """
-        try:
-            if self.render_progress is None:
-                return {'status': 'not_started'}
-            
-            stats = {
-                'progress': {
-                    'current_frame': self.render_progress.current_frame,
-                    'total_frames': self.render_progress.total_frames,
-                    'current_stroke': self.render_progress.current_stroke,
-                    'total_strokes': self.render_progress.total_strokes,
-                    'percentage': self.render_progress.progress_percentage,
-                    'status': self.render_progress.status
-                },
-                'timing': {
-                    'elapsed_time': self.render_progress.elapsed_time,
-                    'estimated_time': self.render_progress.estimated_time
-                },
-                'settings': {
-                    'resolution': self.default_resolution,
-                    'fps': self.default_fps,
-                    'format': self.default_format,
-                    'codec': self.default_codec
-                }
-            }
-            
-            return stats
-            
-        except Exception as e:
-            self.logger.error(f"Error getting render statistics: {str(e)}")
-            return {'error': str(e)}
+        return self.current_progress
+    
+    def is_rendering_active(self) -> bool:
+        """
+        检查是否正在渲染
+        
+        Returns:
+            是否正在渲染
+        """
+        return self.is_rendering
+    
+    def cancel_rendering(self):
+        """取消当前渲染"""
+        # 这里应该实现渲染取消逻辑
+        self.logger.info("Rendering cancellation requested")
+    
+    def clear_frame_cache(self):
+        """清除帧缓存"""
+        self.frame_cache.clear()
+        self.logger.info("Frame cache cleared")
+    
+    def get_supported_formats(self) -> List[str]:
+        """
+        获取支持的输出格式
+        
+        Returns:
+            支持的格式列表
+        """
+        return [format.value for format in RenderFormat]
+    
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """
+        获取性能统计
+        
+        Returns:
+            性能统计信息
+        """
+        return {
+            'is_rendering': self.is_rendering,
+            'frame_cache_size': len(self.frame_cache),
+            'max_cache_size': self.max_cache_size,
+            'enable_frame_caching': self.enable_frame_caching,
+            'multithreading_enabled': self.default_config.enable_multithreading,
+            'max_threads': self.default_config.max_threads
+        }

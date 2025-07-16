@@ -8,6 +8,8 @@ scipy>=1.7.0
 scikit-image>=0.18.0
 scikit-learn>=1.0.0
 imageio>=2.9.0
+cairosvg>=2.5.0  # SVG支持
+svglib>=1.4.0    # SVG解析
 
 # 机器学习（可选，用于高级笔画分类）
 # tensorflow>=2.8.0

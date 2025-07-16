@@ -445,7 +445,8 @@ class ContourAnalyzer:
         num_angle_bins = 12
         
         # 距离分箱（对数尺度）
-        max_distance = np.max(distances[distances > 0]) if np.any(distances > 0) else 1
+        has_positive_distances = bool(np.any(distances > 0))
+        max_distance = np.max(distances[distances > 0]) if has_positive_distances else 1
         distance_bins = np.logspace(0, np.log10(max_distance), num_distance_bins + 1)
         
         # 角度分箱

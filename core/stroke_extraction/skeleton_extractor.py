@@ -313,7 +313,7 @@ class SkeletonExtractor:
         while remaining_points:
             # 找到距离当前点最近的点
             distances = [np.linalg.norm(p - current_point) for p in remaining_points]
-            min_idx = np.argmin(distances)
+            min_idx = int(np.argmin(distances))
             
             # 只考虑相邻的点（距离小于等于sqrt(2)）
             # 安全比较，避免数组真值歧义

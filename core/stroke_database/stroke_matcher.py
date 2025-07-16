@@ -1,721 +1,659 @@
 # -*- coding: utf-8 -*-
 """
-笔画匹配器
+笔触匹配模块
 
-在笔画库中查找与输入笔画最相似的模板
-支持多种相似度度量和匹配策略
+提供笔触相似度计算和匹配功能
 """
 
 import numpy as np
-import cv2
-from typing import Dict, List, Tuple, Optional, Any
+from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
-import logging
-from scipy.spatial.distance import cdist
+import cv2
+from scipy.spatial.distance import euclidean, cosine
 from scipy.optimize import linear_sum_assignment
-from sklearn.metrics.pairwise import cosine_similarity
-import math
+import logging
+from ..stroke_extraction.stroke_detector import Stroke
+from .stroke_database import StrokeTemplate
 
 
 @dataclass
 class MatchResult:
-    """
-    匹配结果数据结构
-    
-    Attributes:
-        template_id (str): 匹配的模板ID
-        similarity_score (float): 相似度分数
-        geometric_similarity (float): 几何相似度
-        texture_similarity (float): 纹理相似度
-        dynamic_similarity (float): 动态特征相似度
-        confidence (float): 匹配置信度
-        transformation (Dict): 变换参数
-        match_details (Dict): 详细匹配信息
-    """
-    template_id: str
+    """匹配结果数据结构"""
+    template_id: int
+    template_name: str
     similarity_score: float
+    feature_similarities: Dict[str, float]
     geometric_similarity: float
-    texture_similarity: float
-    dynamic_similarity: float
+    shape_similarity: float
     confidence: float
-    transformation: Dict[str, Any]
     match_details: Dict[str, Any]
 
 
 class StrokeMatcher:
-    """
-    笔画匹配器
+    """笔触匹配器"""
     
-    提供多种笔画匹配算法和相似度计算方法
-    """
-    
-    def __init__(self, config):
+    def __init__(self, config: Dict[str, Any]):
         """
-        初始化笔画匹配器
+        初始化笔触匹配器
         
         Args:
-            config: 配置对象
+            config: 配置参数
         """
         self.config = config
         self.logger = logging.getLogger(__name__)
         
         # 匹配参数
-        self.geometric_weight = config['stroke_matching'].get('geometric_weight', 0.4)
-        self.texture_weight = config['stroke_matching'].get('texture_weight', 0.3)
-        self.dynamic_weight = config['stroke_matching'].get('dynamic_weight', 0.3)
+        self.similarity_threshold = config.get('similarity_threshold', 0.7)
+        self.feature_weights = config.get('feature_weights', {
+            'geometric': 0.3,
+            'shape': 0.4,
+            'texture': 0.2,
+            'context': 0.1
+        })
         
-        self.similarity_threshold = config['stroke_matching'].get('similarity_threshold', 0.7)
-        self.max_candidates = config['stroke_matching'].get('max_candidates', 50)
+        # 几何特征权重
+        self.geometric_weights = config.get('geometric_weights', {
+            'area': 0.2,
+            'perimeter': 0.15,
+            'length': 0.2,
+            'width': 0.15,
+            'aspect_ratio': 0.15,
+            'angle': 0.15
+        })
         
-        # 几何匹配参数
-        self.skeleton_weight = config['stroke_matching'].get('skeleton_weight', 0.6)
-        self.contour_weight = config['stroke_matching'].get('contour_weight', 0.4)
+        # 形状特征权重
+        self.shape_weights = config.get('shape_weights', {
+            'contour_similarity': 0.4,
+            'skeleton_similarity': 0.3,
+            'fourier_descriptor': 0.3
+        })
         
-        # 动态特征权重
-        self.width_weight = config['stroke_matching'].get('width_weight', 0.4)
-        self.pressure_weight = config['stroke_matching'].get('pressure_weight', 0.3)
-        self.velocity_weight = config['stroke_matching'].get('velocity_weight', 0.3)
-    
-    def find_best_matches(self, query_stroke: Dict[str, Any], 
-                         stroke_database, 
-                         category: str = None,
-                         top_k: int = 5) -> List[MatchResult]:
+        # 缓存
+        self._descriptor_cache = {}
+        
+    def match_stroke(self, stroke: Stroke, templates: List[StrokeTemplate], 
+                    top_k: int = 5) -> List[MatchResult]:
         """
-        查找最佳匹配的笔画模板
+        匹配笔触与模板
         
         Args:
-            query_stroke (Dict): 查询笔画数据
-            stroke_database: 笔画数据库
-            category (str, optional): 限制搜索的类别
-            top_k (int): 返回前k个最佳匹配
+            stroke: 输入笔触
+            templates: 候选模板列表
+            top_k: 返回前k个最佳匹配
             
         Returns:
-            List[MatchResult]: 匹配结果列表
+            匹配结果列表
         """
-        try:
-            # 获取候选模板
-            candidates = self._get_candidates(stroke_database, category)
-            
-            if not candidates:
-                self.logger.warning("No candidate templates found")
-                return []
-            
-            # 计算匹配结果
-            match_results = []
-            
-            for template in candidates:
-                match_result = self._compute_match_score(query_stroke, template)
-                
-                if match_result.similarity_score >= self.similarity_threshold:
-                    match_results.append(match_result)
-            
-            # 按相似度排序
-            match_results.sort(key=lambda x: x.similarity_score, reverse=True)
-            
-            self.logger.info(f"Found {len(match_results)} matches above threshold")
-            return match_results[:top_k]
-            
-        except Exception as e:
-            self.logger.error(f"Error finding matches: {str(e)}")
+        if not templates:
             return []
+        
+        results = []
+        
+        # 预计算笔触特征
+        stroke_features = self._extract_matching_features(stroke)
+        
+        for template in templates:
+            try:
+                # 计算相似度
+                similarity_score, details = self._calculate_similarity(
+                    stroke, stroke_features, template
+                )
+                
+                # 创建匹配结果
+                if similarity_score >= self.similarity_threshold:
+                    result = MatchResult(
+                        template_id=template.id,
+                        template_name=template.name,
+                        similarity_score=similarity_score,
+                        feature_similarities=details['feature_similarities'],
+                        geometric_similarity=details['geometric_similarity'],
+                        shape_similarity=details['shape_similarity'],
+                        confidence=self._calculate_confidence(similarity_score, details),
+                        match_details=details
+                    )
+                    results.append(result)
+                    
+            except Exception as e:
+                self.logger.warning(f"Error matching template {template.id}: {e}")
+                continue
+        
+        # 按相似度排序并返回前k个
+        results.sort(key=lambda x: x.similarity_score, reverse=True)
+        return results[:top_k]
     
-    def _get_candidates(self, stroke_database, category: str = None) -> List:
+    def find_best_match(self, stroke: Stroke, templates: List[StrokeTemplate]) -> Optional[MatchResult]:
         """
-        获取候选模板
+        找到笔触的最佳匹配模板
         
         Args:
-            stroke_database: 笔画数据库
-            category (str, optional): 类别限制
+            stroke: 输入笔触
+            templates: 候选模板列表
             
         Returns:
-            List: 候选模板列表
+            最佳匹配结果，如果没有找到合适的匹配则返回None
         """
-        if category:
-            candidates = stroke_database.get_templates_by_category(category)
-        else:
-            candidates = list(stroke_database.templates.values())
-        
-        # 限制候选数量
-        if len(candidates) > self.max_candidates:
-            # 可以添加预筛选逻辑
-            candidates = candidates[:self.max_candidates]
-        
-        return candidates
+        matches = self.match_stroke(stroke, templates, top_k=1)
+        return matches[0] if matches else None
     
-    def _compute_match_score(self, query_stroke: Dict[str, Any], template) -> MatchResult:
+    def batch_match_strokes(self, strokes: List[Stroke], 
+                           templates: List[StrokeTemplate],
+                           top_k: int = 3) -> Dict[int, List[MatchResult]]:
         """
-        计算匹配分数
+        批量匹配笔触
         
         Args:
-            query_stroke (Dict): 查询笔画
-            template: 模板笔画
+            strokes: 笔触列表
+            templates: 模板列表
+            top_k: 每个笔触返回的最佳匹配数
             
         Returns:
-            MatchResult: 匹配结果
+            笔触ID到匹配结果的映射
+        """
+        results = {}
+        
+        for stroke in strokes:
+            try:
+                matches = self.match_stroke(stroke, templates, top_k)
+                results[stroke.id] = matches
+            except Exception as e:
+                self.logger.error(f"Error matching stroke {stroke.id}: {e}")
+                results[stroke.id] = []
+        
+        return results
+    
+    def find_best_template_assignment(self, strokes: List[Stroke], 
+                                    templates: List[StrokeTemplate]) -> Dict[int, int]:
+        """
+        找到笔触到模板的最佳分配
+        
+        Args:
+            strokes: 笔触列表
+            templates: 模板列表
+            
+        Returns:
+            笔触ID到模板ID的最佳分配
+        """
+        if not strokes or not templates:
+            return {}
+        
+        # 构建相似度矩阵
+        similarity_matrix = np.zeros((len(strokes), len(templates)))
+        
+        for i, stroke in enumerate(strokes):
+            stroke_features = self._extract_matching_features(stroke)
+            for j, template in enumerate(templates):
+                try:
+                    similarity, _ = self._calculate_similarity(
+                        stroke, stroke_features, template
+                    )
+                    similarity_matrix[i, j] = similarity
+                except Exception as e:
+                    self.logger.warning(f"Error calculating similarity: {e}")
+                    similarity_matrix[i, j] = 0.0
+        
+        # 使用匈牙利算法找到最佳分配
+        # 注意：linear_sum_assignment最小化成本，所以我们使用1-similarity
+        cost_matrix = 1.0 - similarity_matrix
+        stroke_indices, template_indices = linear_sum_assignment(cost_matrix)
+        
+        # 构建分配结果
+        assignment = {}
+        for stroke_idx, template_idx in zip(stroke_indices, template_indices):
+            similarity = similarity_matrix[stroke_idx, template_idx]
+            if similarity >= self.similarity_threshold:
+                assignment[strokes[stroke_idx].id] = templates[template_idx].id
+        
+        return assignment
+    
+    def calculate_stroke_similarity(self, stroke1: Stroke, stroke2: Stroke) -> float:
+        """
+        计算两个笔触之间的相似度
+        
+        Args:
+            stroke1: 第一个笔触
+            stroke2: 第二个笔触
+            
+        Returns:
+            相似度分数 (0-1)
         """
         try:
+            # 提取特征
+            features1 = self._extract_matching_features(stroke1)
+            features2 = self._extract_matching_features(stroke2)
+            
             # 计算几何相似度
-            geometric_sim = self._compute_geometric_similarity(query_stroke, template)
-            
-            # 计算纹理相似度
-            texture_sim = self._compute_texture_similarity(query_stroke, template)
-            
-            # 计算动态特征相似度
-            dynamic_sim = self._compute_dynamic_similarity(query_stroke, template)
-            
-            # 计算综合相似度
-            overall_similarity = (
-                self.geometric_weight * geometric_sim +
-                self.texture_weight * texture_sim +
-                self.dynamic_weight * dynamic_sim
+            geometric_sim = self._calculate_geometric_similarity(
+                features1['geometric'], features2['geometric']
             )
             
-            # 计算置信度
-            confidence = self._compute_confidence(
-                geometric_sim, texture_sim, dynamic_sim
+            # 计算形状相似度
+            shape_sim = self._calculate_shape_similarity(
+                stroke1.contour, stroke2.contour,
+                features1.get('skeleton'), features2.get('skeleton')
             )
             
-            # 计算变换参数
-            transformation = self._compute_transformation(query_stroke, template)
+            # 加权平均
+            total_similarity = (
+                geometric_sim * self.feature_weights['geometric'] +
+                shape_sim * self.feature_weights['shape']
+            )
             
-            # 详细匹配信息
-            match_details = {
-                'skeleton_similarity': self._compute_skeleton_similarity(query_stroke, template),
-                'contour_similarity': self._compute_contour_similarity(query_stroke, template),
-                'width_similarity': self._compute_width_similarity(query_stroke, template),
-                'aspect_ratio_diff': abs(
-                    query_stroke.get('aspect_ratio', 1.0) - 
-                    template.features.get('aspect_ratio', 1.0)
-                ),
-                'length_ratio': self._compute_length_ratio(query_stroke, template)
+            return max(0.0, min(1.0, total_similarity))
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating stroke similarity: {e}")
+            return 0.0
+    
+    def _calculate_similarity(self, stroke: Stroke, stroke_features: Dict[str, Any], 
+                            template: StrokeTemplate) -> Tuple[float, Dict[str, Any]]:
+        """
+        计算笔触与模板的相似度
+        
+        Args:
+            stroke: 笔触
+            stroke_features: 预计算的笔触特征
+            template: 模板
+            
+        Returns:
+            相似度分数和详细信息
+        """
+        details = {
+            'feature_similarities': {},
+            'geometric_similarity': 0.0,
+            'shape_similarity': 0.0,
+            'texture_similarity': 0.0,
+            'context_similarity': 0.0
+        }
+        
+        # 几何相似度
+        geometric_sim = self._calculate_geometric_similarity(
+            stroke_features['geometric'], template.features
+        )
+        details['geometric_similarity'] = geometric_sim
+        
+        # 形状相似度
+        shape_sim = self._calculate_shape_similarity(
+            stroke.contour, template.contour,
+            stroke_features.get('skeleton'), template.skeleton
+        )
+        details['shape_similarity'] = shape_sim
+        
+        # 纹理相似度（简化实现）
+        texture_sim = self._calculate_texture_similarity(
+            stroke_features.get('texture', {}), 
+            template.features.get('texture', {})
+        )
+        details['texture_similarity'] = texture_sim
+        
+        # 上下文相似度（简化实现）
+        context_sim = self._calculate_context_similarity(
+            stroke_features.get('context', {}),
+            template.features.get('context', {})
+        )
+        details['context_similarity'] = context_sim
+        
+        # 计算总相似度
+        total_similarity = (
+            geometric_sim * self.feature_weights['geometric'] +
+            shape_sim * self.feature_weights['shape'] +
+            texture_sim * self.feature_weights['texture'] +
+            context_sim * self.feature_weights['context']
+        )
+        
+        # 记录各特征相似度
+        details['feature_similarities'] = {
+            'geometric': geometric_sim,
+            'shape': shape_sim,
+            'texture': texture_sim,
+            'context': context_sim
+        }
+        
+        return max(0.0, min(1.0, total_similarity)), details
+    
+    def _extract_matching_features(self, stroke: Stroke) -> Dict[str, Any]:
+        """
+        提取用于匹配的特征
+        
+        Args:
+            stroke: 笔触
+            
+        Returns:
+            特征字典
+        """
+        features = {
+            'geometric': {
+                'area': stroke.area,
+                'perimeter': stroke.perimeter,
+                'length': stroke.length,
+                'width': stroke.width,
+                'aspect_ratio': stroke.length / max(stroke.width, 1e-6),
+                'angle': stroke.angle
+            },
+            'shape': {
+                'contour': stroke.contour,
+                'fourier_descriptor': self._calculate_fourier_descriptor(stroke.contour)
             }
-            
-            return MatchResult(
-                template_id=template.id,
-                similarity_score=overall_similarity,
-                geometric_similarity=geometric_sim,
-                texture_similarity=texture_sim,
-                dynamic_similarity=dynamic_sim,
-                confidence=confidence,
-                transformation=transformation,
-                match_details=match_details
-            )
-            
-        except Exception as e:
-            self.logger.error(f"Error computing match score for template {template.id}: {str(e)}")
-            return MatchResult(
-                template_id=template.id,
-                similarity_score=0.0,
-                geometric_similarity=0.0,
-                texture_similarity=0.0,
-                dynamic_similarity=0.0,
-                confidence=0.0,
-                transformation={},
-                match_details={}
-            )
+        }
+        
+        # 添加骨架特征（如果可用）
+        if hasattr(stroke, 'skeleton') and stroke.skeleton is not None:
+            features['skeleton'] = stroke.skeleton
+        
+        # 添加纹理特征（简化）
+        features['texture'] = self._extract_texture_features(stroke)
+        
+        # 添加上下文特征（简化）
+        features['context'] = self._extract_context_features(stroke)
+        
+        return features
     
-    def _compute_geometric_similarity(self, query_stroke: Dict[str, Any], template) -> float:
+    def _calculate_geometric_similarity(self, features1: Dict[str, float], 
+                                      features2: Dict[str, float]) -> float:
         """
-        计算几何相似度
+        计算几何特征相似度
         
         Args:
-            query_stroke (Dict): 查询笔画
-            template: 模板笔画
+            features1: 第一组几何特征
+            features2: 第二组几何特征
             
         Returns:
-            float: 几何相似度
+            几何相似度
         """
-        try:
-            # 骨架相似度
-            skeleton_sim = self._compute_skeleton_similarity(query_stroke, template)
-            
-            # 轮廓相似度
-            contour_sim = self._compute_contour_similarity(query_stroke, template)
-            
-            # 综合几何相似度
-            geometric_sim = (
-                self.skeleton_weight * skeleton_sim +
-                self.contour_weight * contour_sim
-            )
-            
-            return geometric_sim
-            
-        except Exception as e:
-            self.logger.error(f"Error computing geometric similarity: {str(e)}")
-            return 0.0
+        similarities = []
+        
+        for feature_name, weight in self.geometric_weights.items():
+            if feature_name in features1 and feature_name in features2:
+                val1 = features1[feature_name]
+                val2 = features2[feature_name]
+                
+                # 归一化相似度计算
+                if feature_name == 'angle':
+                    # 角度特殊处理（考虑周期性）
+                    diff = abs(val1 - val2)
+                    diff = min(diff, 360 - diff)
+                    similarity = 1.0 - (diff / 180.0)
+                else:
+                    # 其他特征使用相对差异
+                    max_val = max(abs(val1), abs(val2), 1e-6)
+                    similarity = 1.0 - abs(val1 - val2) / max_val
+                
+                similarities.append(similarity * weight)
+        
+        return sum(similarities) if similarities else 0.0
     
-    def _compute_skeleton_similarity(self, query_stroke: Dict[str, Any], template) -> float:
+    def _calculate_shape_similarity(self, contour1: np.ndarray, contour2: np.ndarray,
+                                  skeleton1: np.ndarray = None, 
+                                  skeleton2: np.ndarray = None) -> float:
         """
-        计算骨架相似度
+        计算形状相似度
         
         Args:
-            query_stroke (Dict): 查询笔画
-            template: 模板笔画
+            contour1: 第一个轮廓
+            contour2: 第二个轮廓
+            skeleton1: 第一个骨架
+            skeleton2: 第二个骨架
             
         Returns:
-            float: 骨架相似度
+            形状相似度
         """
-        try:
-            query_skeleton = query_stroke.get('skeleton')
-            template_skeleton = template.skeleton
-            
-            if query_skeleton is None or template_skeleton is None:
-                return 0.0
-            
-            # 归一化骨架
-            query_norm = self._normalize_skeleton(query_skeleton)
-            template_norm = self._normalize_skeleton(template_skeleton)
-            
-            # 重采样到相同长度
-            target_length = min(len(query_norm), len(template_norm), 100)
-            query_resampled = self._resample_curve(query_norm, target_length)
-            template_resampled = self._resample_curve(template_norm, target_length)
-            
-            # 计算点对点距离
-            distances = np.linalg.norm(query_resampled - template_resampled, axis=1)
-            mean_distance = np.mean(distances)
-            
-            # 转换为相似度（距离越小，相似度越高）
-            max_distance = np.sqrt(2)  # 归一化空间中的最大距离
-            similarity = max(0, 1 - mean_distance / max_distance)
-            
-            return similarity
-            
-        except Exception as e:
-            self.logger.error(f"Error computing skeleton similarity: {str(e)}")
-            return 0.0
+        similarities = []
+        
+        # 轮廓相似度
+        if len(contour1) > 0 and len(contour2) > 0:
+            contour_sim = self._calculate_contour_similarity(contour1, contour2)
+            similarities.append(contour_sim * self.shape_weights['contour_similarity'])
+        
+        # 骨架相似度
+        if skeleton1 is not None and skeleton2 is not None:
+            skeleton_sim = self._calculate_skeleton_similarity(skeleton1, skeleton2)
+            similarities.append(skeleton_sim * self.shape_weights['skeleton_similarity'])
+        
+        # 傅里叶描述子相似度
+        fd1 = self._calculate_fourier_descriptor(contour1)
+        fd2 = self._calculate_fourier_descriptor(contour2)
+        if fd1 is not None and fd2 is not None:
+            fd_sim = self._calculate_fourier_similarity(fd1, fd2)
+            similarities.append(fd_sim * self.shape_weights['fourier_descriptor'])
+        
+        return sum(similarities) if similarities else 0.0
     
-    def _compute_contour_similarity(self, query_stroke: Dict[str, Any], template) -> float:
+    def _calculate_contour_similarity(self, contour1: np.ndarray, 
+                                    contour2: np.ndarray) -> float:
         """
         计算轮廓相似度
         
         Args:
-            query_stroke (Dict): 查询笔画
-            template: 模板笔画
+            contour1: 第一个轮廓
+            contour2: 第二个轮廓
             
         Returns:
-            float: 轮廓相似度
+            轮廓相似度
         """
         try:
-            query_contour = query_stroke.get('contour')
-            template_contour = template.contour
+            # 使用OpenCV的matchShapes函数
+            similarity = cv2.matchShapes(contour1, contour2, cv2.CONTOURS_MATCH_I1, 0)
+            # 转换为0-1范围的相似度
+            return max(0.0, 1.0 - similarity)
+        except Exception as e:
+            self.logger.warning(f"Error calculating contour similarity: {e}")
+            return 0.0
+    
+    def _calculate_skeleton_similarity(self, skeleton1: np.ndarray, 
+                                     skeleton2: np.ndarray) -> float:
+        """
+        计算骨架相似度
+        
+        Args:
+            skeleton1: 第一个骨架
+            skeleton2: 第二个骨架
             
-            if query_contour is None or template_contour is None:
+        Returns:
+            骨架相似度
+        """
+        try:
+            # 简化实现：使用点集之间的Hausdorff距离
+            if len(skeleton1) == 0 or len(skeleton2) == 0:
                 return 0.0
             
-            # 使用Hu矩进行形状匹配
-            query_moments = cv2.HuMoments(cv2.moments(query_contour))
-            template_moments = cv2.HuMoments(cv2.moments(template_contour))
+            # 归一化骨架点
+            skel1_norm = self._normalize_points(skeleton1)
+            skel2_norm = self._normalize_points(skeleton2)
             
-            # 计算Hu矩距离
-            hu_distance = cv2.matchShapes(query_contour, template_contour, cv2.CONTOURS_MATCH_I1, 0)
+            # 计算双向Hausdorff距离
+            dist1 = self._hausdorff_distance(skel1_norm, skel2_norm)
+            dist2 = self._hausdorff_distance(skel2_norm, skel1_norm)
+            hausdorff_dist = max(dist1, dist2)
             
             # 转换为相似度
-            similarity = max(0, 1 / (1 + hu_distance))
-            
-            return similarity
+            return max(0.0, 1.0 - hausdorff_dist)
             
         except Exception as e:
-            self.logger.error(f"Error computing contour similarity: {str(e)}")
+            self.logger.warning(f"Error calculating skeleton similarity: {e}")
             return 0.0
     
-    def _compute_texture_similarity(self, query_stroke: Dict[str, Any], template) -> float:
+    def _calculate_fourier_descriptor(self, contour: np.ndarray) -> Optional[np.ndarray]:
         """
-        计算纹理相似度
+        计算傅里叶描述子
         
         Args:
-            query_stroke (Dict): 查询笔画
-            template: 模板笔画
+            contour: 轮廓点
             
         Returns:
-            float: 纹理相似度
+            傅里叶描述子
         """
         try:
-            # 提取纹理特征
-            query_texture = query_stroke.get('texture_features', {})
-            template_texture = template.features.get('texture_features', {})
+            if len(contour) < 3:
+                return None
             
-            if not query_texture or not template_texture:
-                return 0.5  # 默认中等相似度
+            # 将轮廓转换为复数序列
+            contour_points = contour.reshape(-1, 2)
+            complex_contour = contour_points[:, 0] + 1j * contour_points[:, 1]
             
-            # 比较各种纹理特征
-            similarities = []
+            # 计算FFT
+            fft_result = np.fft.fft(complex_contour)
             
-            # 对比度
-            if 'contrast' in query_texture and 'contrast' in template_texture:
-                contrast_sim = 1 - abs(query_texture['contrast'] - template_texture['contrast']) / 255
-                similarities.append(contrast_sim)
+            # 取前几个系数作为描述子（归一化）
+            n_descriptors = min(16, len(fft_result) // 2)
+            descriptors = fft_result[1:n_descriptors+1]  # 跳过DC分量
             
-            # 能量
-            if 'energy' in query_texture and 'energy' in template_texture:
-                energy_sim = 1 - abs(query_texture['energy'] - template_texture['energy'])
-                similarities.append(energy_sim)
+            # 归一化（平移和缩放不变性）
+            if len(descriptors) > 0 and abs(descriptors[0]) > 1e-6:
+                descriptors = descriptors / abs(descriptors[0])
             
-            # 均匀性
-            if 'homogeneity' in query_texture and 'homogeneity' in template_texture:
-                homogeneity_sim = 1 - abs(query_texture['homogeneity'] - template_texture['homogeneity'])
-                similarities.append(homogeneity_sim)
+            return np.abs(descriptors)  # 只保留幅度（旋转不变性）
             
-            if similarities:
-                return np.mean(similarities)
-            else:
-                return 0.5
-                
         except Exception as e:
-            self.logger.error(f"Error computing texture similarity: {str(e)}")
-            return 0.5
+            self.logger.warning(f"Error calculating Fourier descriptor: {e}")
+            return None
     
-    def _compute_dynamic_similarity(self, query_stroke: Dict[str, Any], template) -> float:
+    def _calculate_fourier_similarity(self, fd1: np.ndarray, fd2: np.ndarray) -> float:
         """
-        计算动态特征相似度
+        计算傅里叶描述子相似度
         
         Args:
-            query_stroke (Dict): 查询笔画
-            template: 模板笔画
+            fd1: 第一个傅里叶描述子
+            fd2: 第二个傅里叶描述子
             
         Returns:
-            float: 动态特征相似度
+            相似度
         """
         try:
-            # 宽度变化相似度
-            width_sim = self._compute_width_similarity(query_stroke, template)
+            # 确保长度一致
+            min_len = min(len(fd1), len(fd2))
+            if min_len == 0:
+                return 0.0
             
-            # 压力变化相似度（如果有的话）
-            pressure_sim = self._compute_pressure_similarity(query_stroke, template)
+            fd1_truncated = fd1[:min_len]
+            fd2_truncated = fd2[:min_len]
             
-            # 速度变化相似度（如果有的话）
-            velocity_sim = self._compute_velocity_similarity(query_stroke, template)
-            
-            # 综合动态相似度
-            dynamic_sim = (
-                self.width_weight * width_sim +
-                self.pressure_weight * pressure_sim +
-                self.velocity_weight * velocity_sim
-            )
-            
-            return dynamic_sim
+            # 使用余弦相似度
+            similarity = 1.0 - cosine(fd1_truncated, fd2_truncated)
+            return max(0.0, min(1.0, similarity))
             
         except Exception as e:
-            self.logger.error(f"Error computing dynamic similarity: {str(e)}")
+            self.logger.warning(f"Error calculating Fourier similarity: {e}")
             return 0.0
     
-    def _compute_width_similarity(self, query_stroke: Dict[str, Any], template) -> float:
+    def _calculate_texture_similarity(self, texture1: Dict[str, Any], 
+                                    texture2: Dict[str, Any]) -> float:
         """
-        计算宽度变化相似度
+        计算纹理相似度（简化实现）
         
         Args:
-            query_stroke (Dict): 查询笔画
-            template: 模板笔画
+            texture1: 第一组纹理特征
+            texture2: 第二组纹理特征
             
         Returns:
-            float: 宽度相似度
+            纹理相似度
         """
-        try:
-            query_width = query_stroke.get('width_profile')
-            template_width = template.width_profile
-            
-            if query_width is None or template_width is None:
-                return 0.5
-            
-            # 归一化宽度曲线
-            query_width_norm = self._normalize_profile(query_width)
-            template_width_norm = self._normalize_profile(template_width)
-            
-            # 重采样到相同长度
-            target_length = min(len(query_width_norm), len(template_width_norm), 50)
-            query_resampled = self._resample_profile(query_width_norm, target_length)
-            template_resampled = self._resample_profile(template_width_norm, target_length)
-            
-            # 计算相关系数
-            correlation = np.corrcoef(query_resampled, template_resampled)[0, 1]
-            
-            # 处理NaN值
-            if np.isnan(correlation):
-                correlation = 0
-            
-            # 转换为正相似度
-            similarity = (correlation + 1) / 2
-            
-            return similarity
-            
-        except Exception as e:
-            self.logger.error(f"Error computing width similarity: {str(e)}")
-            return 0.5
+        # 简化实现：返回固定值
+        return 0.5
     
-    def _compute_pressure_similarity(self, query_stroke: Dict[str, Any], template) -> float:
+    def _calculate_context_similarity(self, context1: Dict[str, Any], 
+                                    context2: Dict[str, Any]) -> float:
         """
-        计算压力变化相似度
+        计算上下文相似度（简化实现）
         
         Args:
-            query_stroke (Dict): 查询笔画
-            template: 模板笔画
+            context1: 第一组上下文特征
+            context2: 第二组上下文特征
             
         Returns:
-            float: 压力相似度
+            上下文相似度
         """
-        try:
-            query_pressure = query_stroke.get('pressure_profile')
-            template_pressure = template.pressure_profile
-            
-            if query_pressure is None or template_pressure is None:
-                return 0.5  # 默认中等相似度
-            
-            # 类似宽度相似度的计算
-            query_pressure_norm = self._normalize_profile(query_pressure)
-            template_pressure_norm = self._normalize_profile(template_pressure)
-            
-            target_length = min(len(query_pressure_norm), len(template_pressure_norm), 50)
-            query_resampled = self._resample_profile(query_pressure_norm, target_length)
-            template_resampled = self._resample_profile(template_pressure_norm, target_length)
-            
-            correlation = np.corrcoef(query_resampled, template_resampled)[0, 1]
-            
-            if np.isnan(correlation):
-                correlation = 0
-            
-            similarity = (correlation + 1) / 2
-            return similarity
-            
-        except Exception as e:
-            self.logger.error(f"Error computing pressure similarity: {str(e)}")
-            return 0.5
+        # 简化实现：返回固定值
+        return 0.5
     
-    def _compute_velocity_similarity(self, query_stroke: Dict[str, Any], template) -> float:
+    def _extract_texture_features(self, stroke: Stroke) -> Dict[str, Any]:
         """
-        计算速度变化相似度
+        提取纹理特征（简化实现）
         
         Args:
-            query_stroke (Dict): 查询笔画
-            template: 模板笔画
+            stroke: 笔触
             
         Returns:
-            float: 速度相似度
+            纹理特征
         """
-        try:
-            query_velocity = query_stroke.get('velocity_profile')
-            template_velocity = template.velocity_profile
-            
-            if query_velocity is None or template_velocity is None:
-                return 0.5  # 默认中等相似度
-            
-            # 类似宽度相似度的计算
-            query_velocity_norm = self._normalize_profile(query_velocity)
-            template_velocity_norm = self._normalize_profile(template_velocity)
-            
-            target_length = min(len(query_velocity_norm), len(template_velocity_norm), 50)
-            query_resampled = self._resample_profile(query_velocity_norm, target_length)
-            template_resampled = self._resample_profile(template_velocity_norm, target_length)
-            
-            correlation = np.corrcoef(query_resampled, template_resampled)[0, 1]
-            
-            if np.isnan(correlation):
-                correlation = 0
-            
-            similarity = (correlation + 1) / 2
-            return similarity
-            
-        except Exception as e:
-            self.logger.error(f"Error computing velocity similarity: {str(e)}")
-            return 0.5
+        return {'placeholder': True}
     
-    def _compute_confidence(self, geometric_sim: float, texture_sim: float, dynamic_sim: float) -> float:
+    def _extract_context_features(self, stroke: Stroke) -> Dict[str, Any]:
+        """
+        提取上下文特征（简化实现）
+        
+        Args:
+            stroke: 笔触
+            
+        Returns:
+            上下文特征
+        """
+        return {'placeholder': True}
+    
+    def _calculate_confidence(self, similarity_score: float, 
+                            details: Dict[str, Any]) -> float:
         """
         计算匹配置信度
         
         Args:
-            geometric_sim (float): 几何相似度
-            texture_sim (float): 纹理相似度
-            dynamic_sim (float): 动态相似度
+            similarity_score: 相似度分数
+            details: 匹配详细信息
             
         Returns:
-            float: 置信度
+            置信度
         """
-        # 基于各项相似度的一致性计算置信度
-        similarities = [geometric_sim, texture_sim, dynamic_sim]
-        mean_sim = np.mean(similarities)
-        std_sim = np.std(similarities)
-        
-        # 一致性越高，置信度越高
-        consistency = max(0, 1 - std_sim)
-        
-        # 综合平均相似度和一致性
-        confidence = 0.7 * mean_sim + 0.3 * consistency
-        
-        return confidence
+        # 基于相似度分数和特征一致性计算置信度
+        feature_consistency = np.std(list(details['feature_similarities'].values()))
+        confidence = similarity_score * (1.0 - feature_consistency)
+        return max(0.0, min(1.0, confidence))
     
-    def _compute_transformation(self, query_stroke: Dict[str, Any], template) -> Dict[str, Any]:
+    def _normalize_points(self, points: np.ndarray) -> np.ndarray:
         """
-        计算从模板到查询笔画的变换参数
+        归一化点集
         
         Args:
-            query_stroke (Dict): 查询笔画
-            template: 模板笔画
+            points: 点集
             
         Returns:
-            Dict: 变换参数
+            归一化后的点集
         """
-        try:
-            transformation = {
-                'scale': 1.0,
-                'rotation': 0.0,
-                'translation': [0.0, 0.0],
-                'shear': 0.0
-            }
-            
-            # 计算尺度变换
-            query_bbox = query_stroke.get('bounding_rect')
-            template_bbox = template.features.get('bounding_rect')
-            
-            if query_bbox and template_bbox:
-                query_w, query_h = query_bbox[2], query_bbox[3]
-                template_w, template_h = template_bbox[2], template_bbox[3]
-                
-                if template_w > 0 and template_h > 0:
-                    scale_x = query_w / template_w
-                    scale_y = query_h / template_h
-                    transformation['scale'] = (scale_x + scale_y) / 2
-            
-            # 计算旋转角度（基于主方向）
-            query_orientation = query_stroke.get('orientation', 0)
-            template_orientation = template.features.get('orientation', 0)
-            transformation['rotation'] = query_orientation - template_orientation
-            
-            # 计算平移（基于质心）
-            query_centroid = query_stroke.get('centroid')
-            template_centroid = template.features.get('centroid')
-            
-            if query_centroid and template_centroid:
-                transformation['translation'] = [
-                    query_centroid[0] - template_centroid[0],
-                    query_centroid[1] - template_centroid[1]
-                ]
-            
-            return transformation
-            
-        except Exception as e:
-            self.logger.error(f"Error computing transformation: {str(e)}")
-            return {'scale': 1.0, 'rotation': 0.0, 'translation': [0.0, 0.0], 'shear': 0.0}
-    
-    def _compute_length_ratio(self, query_stroke: Dict[str, Any], template) -> float:
-        """
-        计算长度比例
+        if len(points) == 0:
+            return points
         
-        Args:
-            query_stroke (Dict): 查询笔画
-            template: 模板笔画
-            
-        Returns:
-            float: 长度比例
-        """
-        try:
-            query_length = query_stroke.get('length', 0)
-            template_length = template.features.get('length', 0)
-            
-            if template_length > 0:
-                return query_length / template_length
-            else:
-                return 1.0
-                
-        except Exception:
-            return 1.0
-    
-    def _normalize_skeleton(self, skeleton: np.ndarray) -> np.ndarray:
-        """
-        归一化骨架坐标
+        points = points.reshape(-1, 2)
         
-        Args:
-            skeleton (np.ndarray): 骨架点
-            
-        Returns:
-            np.ndarray: 归一化骨架
-        """
-        if len(skeleton) == 0:
-            return skeleton
+        # 中心化
+        centroid = np.mean(points, axis=0)
+        centered = points - centroid
         
-        # 计算边界框
-        min_coords = np.min(skeleton, axis=0)
-        max_coords = np.max(skeleton, axis=0)
-        
-        # 避免除零
-        range_coords = max_coords - min_coords
-        range_coords[range_coords == 0] = 1
-        
-        # 归一化到[0, 1]
-        normalized = (skeleton - min_coords) / range_coords
+        # 缩放
+        max_dist = np.max(np.linalg.norm(centered, axis=1))
+        if max_dist > 1e-6:
+            normalized = centered / max_dist
+        else:
+            normalized = centered
         
         return normalized
     
-    def _normalize_profile(self, profile: np.ndarray) -> np.ndarray:
+    def _hausdorff_distance(self, points1: np.ndarray, points2: np.ndarray) -> float:
         """
-        归一化轮廓曲线
+        计算Hausdorff距离
         
         Args:
-            profile (np.ndarray): 轮廓曲线
+            points1: 第一组点
+            points2: 第二组点
             
         Returns:
-            np.ndarray: 归一化轮廓
+            Hausdorff距离
         """
-        if len(profile) == 0:
-            return profile
+        if len(points1) == 0 or len(points2) == 0:
+            return float('inf')
         
-        min_val = np.min(profile)
-        max_val = np.max(profile)
+        # 计算每个点到另一组点的最小距离
+        max_min_dist = 0.0
+        for p1 in points1:
+            min_dist = float('inf')
+            for p2 in points2:
+                dist = euclidean(p1, p2)
+                min_dist = min(min_dist, dist)
+            max_min_dist = max(max_min_dist, min_dist)
         
-        if max_val - min_val > 0:
-            normalized = (profile - min_val) / (max_val - min_val)
-        else:
-            normalized = np.zeros_like(profile)
-        
-        return normalized
-    
-    def _resample_curve(self, curve: np.ndarray, target_length: int) -> np.ndarray:
-        """
-        重采样曲线到指定长度
-        
-        Args:
-            curve (np.ndarray): 输入曲线
-            target_length (int): 目标长度
-            
-        Returns:
-            np.ndarray: 重采样曲线
-        """
-        if len(curve) == 0:
-            return np.zeros((target_length, curve.shape[1] if curve.ndim > 1 else 1))
-        
-        if len(curve) == target_length:
-            return curve
-        
-        # 线性插值重采样
-        indices = np.linspace(0, len(curve) - 1, target_length)
-        
-        if curve.ndim == 1:
-            resampled = np.interp(indices, np.arange(len(curve)), curve)
-        else:
-            resampled = np.zeros((target_length, curve.shape[1]))
-            for i in range(curve.shape[1]):
-                resampled[:, i] = np.interp(indices, np.arange(len(curve)), curve[:, i])
-        
-        return resampled
-    
-    def _resample_profile(self, profile: np.ndarray, target_length: int) -> np.ndarray:
-        """
-        重采样轮廓到指定长度
-        
-        Args:
-            profile (np.ndarray): 输入轮廓
-            target_length (int): 目标长度
-            
-        Returns:
-            np.ndarray: 重采样轮廓
-        """
-        if len(profile) == 0:
-            return np.zeros(target_length)
-        
-        if len(profile) == target_length:
-            return profile
-        
-        # 线性插值重采样
-        indices = np.linspace(0, len(profile) - 1, target_length)
-        resampled = np.interp(indices, np.arange(len(profile)), profile)
-        
-        return resampled
+        return max_min_dist

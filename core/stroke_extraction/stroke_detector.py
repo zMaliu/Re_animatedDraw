@@ -1,567 +1,476 @@
 # -*- coding: utf-8 -*-
 """
-笔画检测器
+笔触检测模块
 
-实现从中国画图像中检测和提取笔画的核心算法
-基于论文《Animated Construction of Chinese Brush Paintings》的方法
+实现基于区域增长和自适应阈值的笔触检测算法
 """
 
 import cv2
 import numpy as np
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Any, Optional
 from dataclasses import dataclass
-from skimage import morphology, measure
-from scipy import ndimage
-import matplotlib.pyplot as plt
+from enum import Enum
 
-from .skeleton_extractor import SkeletonExtractor
-from .contour_analyzer import ContourAnalyzer
+
+class DetectionMethod(Enum):
+    """检测方法枚举"""
+    REGION_GROWING = "region_growing"
+    ADAPTIVE_THRESHOLD = "adaptive_threshold"
+    CONTOUR_BASED = "contour_based"
+    HYBRID = "hybrid"
 
 
 @dataclass
 class Stroke:
-    """
-    笔画数据结构
-    
-    Attributes:
-        id (int): 笔画唯一标识
-        skeleton (np.ndarray): 笔画骨架点序列
-        contour (np.ndarray): 笔画轮廓点序列
-        width_profile (np.ndarray): 沿骨架的宽度变化
-        texture_profile (np.ndarray): 沿骨架的纹理变化
-        bbox (tuple): 边界框 (x, y, w, h)
-        area (float): 笔画面积
-        length (float): 笔画长度
-        orientation (float): 主方向角度
-        stroke_type (str): 笔画类型
-        confidence (float): 检测置信度
-    """
+    """笔触数据结构"""
     id: int
-    skeleton: np.ndarray
     contour: np.ndarray
-    width_profile: np.ndarray
-    texture_profile: np.ndarray
-    bbox: Tuple[int, int, int, int]
+    mask: np.ndarray
+    bbox: Tuple[int, int, int, int]  # (x, y, width, height)
+    center: Tuple[float, float]
     area: float
+    perimeter: float
     length: float
-    orientation: float
-    stroke_type: str = "unknown"
-    confidence: float = 0.0
+    width: float
+    angle: float
+    confidence: float
+    features: Dict[str, Any]
+    
+    def __post_init__(self):
+        """后处理初始化"""
+        if self.features is None:
+            self.features = {}
 
 
 class StrokeDetector:
-    """
-    笔画检测器
+    """笔触检测器"""
     
-    使用多种图像处理技术检测和提取中国画中的笔画
-    """
-    
-    def __init__(self, config):
+    def __init__(self, config: Dict[str, Any] = None):
         """
-        初始化笔画检测器
+        初始化笔触检测器
         
         Args:
-            config: 配置对象
+            config: 配置参数
         """
-        self.config = config
-        self.skeleton_extractor = SkeletonExtractor(config)
-        self.contour_analyzer = ContourAnalyzer(config)
+        self.config = config or self._get_default_config()
+        self.method = DetectionMethod(self.config.get('method', 'region_growing'))
         
-        # 检测参数
-        self.canny_low = config['stroke_detection']['canny_low_threshold']
-        self.canny_high = config['stroke_detection']['canny_high_threshold']
-        self.min_stroke_length = config['stroke_detection']['min_stroke_length']
-        self.max_stroke_width = config['stroke_detection']['max_stroke_width']
-        self.morph_kernel_size = config['stroke_detection']['morphology_kernel_size']
-        
+    def _get_default_config(self) -> Dict[str, Any]:
+        """获取默认配置"""
+        return {
+            'method': 'region_growing',
+            'adaptive_block_size': 25,
+            'adaptive_c': 10,
+            'region_growing_threshold': 2.0,
+            'min_region_size': 100,
+            'min_stroke_length': 10,
+            'max_stroke_width': 50,
+            'gaussian_blur_kernel': 5,
+            'morphology_kernel_size': 3,
+            'contour_min_area': 50,
+            'contour_approximation_epsilon': 0.02
+        }
+    
     def detect_strokes(self, image: np.ndarray) -> List[Stroke]:
         """
-        检测图像中的所有笔画
+        检测图像中的笔触
         
         Args:
-            image (np.ndarray): 输入图像
+            image: 输入图像
             
         Returns:
-            List[Stroke]: 检测到的笔画列表
+            检测到的笔触列表
         """
-        print("开始笔画检测...")
-        
-        # 1. 图像预处理
-        processed_image = self._preprocess_image(image)
-        
-        # 2. 边缘检测
-        edges = self._detect_edges(processed_image)
-        
-        # 3. 连通组件分析
-        components = self._find_connected_components(edges)
-        
-        # 4. 笔画候选区域提取
-        stroke_candidates = self._extract_stroke_candidates(components, processed_image)
-        
-        # 5. 笔画验证和特征提取
-        strokes = self._validate_and_extract_features(stroke_candidates, processed_image)
-        
-        # 6. 笔画分类
-        classified_strokes = self._classify_strokes(strokes)
-        
-        print(f"检测完成，共找到 {len(classified_strokes)} 个有效笔画")
-        return classified_strokes
-    
-    def _preprocess_image(self, image: np.ndarray) -> np.ndarray:
-        """
-        图像预处理
-        
-        Args:
-            image (np.ndarray): 原始图像
-            
-        Returns:
-            np.ndarray: 预处理后的图像
-        """
-        # 转换为灰度图
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        if self.method == DetectionMethod.REGION_GROWING:
+            return self._detect_by_region_growing(image)
+        elif self.method == DetectionMethod.ADAPTIVE_THRESHOLD:
+            return self._detect_by_adaptive_threshold(image)
+        elif self.method == DetectionMethod.CONTOUR_BASED:
+            return self._detect_by_contours(image)
+        elif self.method == DetectionMethod.HYBRID:
+            return self._detect_by_hybrid_method(image)
         else:
-            gray = image.copy()
+            raise ValueError(f"Unsupported detection method: {self.method}")
+    
+    def _detect_by_region_growing(self, image: np.ndarray) -> List[Stroke]:
+        """基于区域增长的笔触检测"""
+        # 预处理
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        blurred = cv2.GaussianBlur(gray, (self.config['gaussian_blur_kernel'], 
+                                         self.config['gaussian_blur_kernel']), 0)
         
-        # 高斯模糊去噪
-        kernel_size = self.config['image']['gaussian_blur_kernel']
-        blurred = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
-        
-        # 双边滤波保持边缘
-        bilateral = cv2.bilateralFilter(
-            blurred,
-            self.config['image']['bilateral_filter_d'],
-            self.config['image']['bilateral_filter_sigma_color'],
-            self.config['image']['bilateral_filter_sigma_space']
+        # 自适应阈值
+        binary = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV,
+            self.config['adaptive_block_size'], self.config['adaptive_c']
         )
         
-        # 直方图均衡化增强对比度
-        equalized = cv2.equalizeHist(bilateral)
+        # 形态学操作
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, 
+                                         (self.config['morphology_kernel_size'],
+                                          self.config['morphology_kernel_size']))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         
-        return equalized
+        # 区域增长
+        labeled_image = self._region_growing(binary)
+        
+        # 提取笔触
+        return self._extract_strokes_from_labeled_image(labeled_image, binary)
     
-    def _detect_edges(self, image: np.ndarray) -> np.ndarray:
-        """
-        边缘检测
+    def _detect_by_adaptive_threshold(self, image: np.ndarray) -> List[Stroke]:
+        """基于自适应阈值的笔触检测"""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
         
-        Args:
-            image (np.ndarray): 预处理后的图像
-            
-        Returns:
-            np.ndarray: 边缘图像
-        """
+        # 自适应阈值
+        binary = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV,
+            self.config['adaptive_block_size'], self.config['adaptive_c']
+        )
+        
+        # 查找轮廓
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        return self._contours_to_strokes(contours, binary)
+    
+    def _detect_by_contours(self, image: np.ndarray) -> List[Stroke]:
+        """基于轮廓的笔触检测"""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        
         # Canny边缘检测
-        edges = cv2.Canny(image, self.canny_low, self.canny_high)
+        edges = cv2.Canny(gray, 50, 150)
         
-        # 形态学操作连接断裂的边缘
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, 
-            (self.morph_kernel_size, self.morph_kernel_size)
-        )
-        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+        # 查找轮廓
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        return edges
+        return self._contours_to_strokes(contours, edges)
     
-    def _find_connected_components(self, edges: np.ndarray) -> List[np.ndarray]:
-        """
-        连通组件分析
+    def _detect_by_hybrid_method(self, image: np.ndarray) -> List[Stroke]:
+        """混合方法检测"""
+        # 结合多种方法的结果
+        strokes_rg = self._detect_by_region_growing(image)
+        strokes_at = self._detect_by_adaptive_threshold(image)
+        strokes_ct = self._detect_by_contours(image)
         
-        Args:
-            edges (np.ndarray): 边缘图像
-            
-        Returns:
-            List[np.ndarray]: 连通组件列表
-        """
-        # 标记连通组件
-        num_labels, labels = cv2.connectedComponents(edges)
-        
-        components = []
-        for label in range(1, num_labels):  # 跳过背景(标签0)
-            component_mask = (labels == label).astype(np.uint8) * 255
-            
-            # 过滤太小的组件
-            area = np.sum(component_mask > 0)
-            if area >= self.min_stroke_length:
-                components.append(component_mask)
-        
-        return components
+        # 合并和去重
+        all_strokes = strokes_rg + strokes_at + strokes_ct
+        return self._merge_duplicate_strokes(all_strokes)
     
-    def _extract_stroke_candidates(self, components: List[np.ndarray], 
-                                 original_image: np.ndarray) -> List[Dict]:
-        """
-        提取笔画候选区域
+    def _region_growing(self, binary_image: np.ndarray) -> np.ndarray:
+        """区域增长算法"""
+        height, width = binary_image.shape
+        labeled = np.zeros((height, width), dtype=np.int32)
+        label = 1
         
-        Args:
-            components (List[np.ndarray]): 连通组件列表
-            original_image (np.ndarray): 原始图像
-            
-        Returns:
-            List[Dict]: 笔画候选区域信息
-        """
-        candidates = []
+        for y in range(height):
+            for x in range(width):
+                if binary_image[y, x] > 0 and labeled[y, x] == 0:
+                    # 开始新的区域增长
+                    region_size = self._grow_region(binary_image, labeled, x, y, label)
+                    
+                    if region_size >= self.config['min_region_size']:
+                        label += 1
+                    else:
+                        # 移除太小的区域
+                        label_indices = labeled == label
+                        labeled[label_indices] = 0
         
-        for i, component in enumerate(components):
-            # 计算边界框
-            contours, _ = cv2.findContours(
-                component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
+        return labeled
+    
+    def _grow_region(self, binary_image: np.ndarray, labeled: np.ndarray, 
+                    start_x: int, start_y: int, label: int) -> int:
+        """从种子点开始增长区域"""
+        height, width = binary_image.shape
+        stack = [(start_x, start_y)]
+        region_size = 0
+        threshold = self.config['region_growing_threshold']
+        
+        while stack:
+            x, y = stack.pop()
             
-            if not contours:
+            if (x < 0 or x >= width or y < 0 or y >= height or 
+                labeled[y, x] != 0 or binary_image[y, x] == 0):
                 continue
+            
+            labeled[y, x] = label
+            region_size += 1
+            
+            # 检查8邻域
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    if dx == 0 and dy == 0:
+                        continue
+                    
+                    nx, ny = x + dx, y + dy
+                    if (0 <= nx < width and 0 <= ny < height and 
+                        labeled[ny, nx] == 0 and binary_image[ny, nx] > 0):
+                        
+                        # 检查相似性
+                        if abs(int(binary_image[y, x]) - int(binary_image[ny, nx])) <= threshold:
+                            stack.append((nx, ny))
+        
+        return region_size
+    
+    def _extract_strokes_from_labeled_image(self, labeled_image: np.ndarray, 
+                                           binary_image: np.ndarray) -> List[Stroke]:
+        """从标记图像中提取笔触"""
+        strokes = []
+        unique_labels = np.unique(labeled_image)
+        
+        stroke_id = 0
+        for label in unique_labels:
+            if label == 0:  # 跳过背景
+                continue
+            
+            # 创建掩码
+            mask = (labeled_image == label).astype(np.uint8) * 255
+            
+            # 查找轮廓
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours:
+                # 选择最大的轮廓
+                contour = max(contours, key=cv2.contourArea)
                 
-            # 选择最大的轮廓
-            main_contour = max(contours, key=cv2.contourArea)
-            x, y, w, h = cv2.boundingRect(main_contour)
-            
-            # 过滤不合理的候选区域
-            if w < 5 or h < 5 or max(w, h) > self.max_stroke_width * 10:
-                continue
-            
-            # 提取候选区域
-            roi = component[y:y+h, x:x+w]
-            original_roi = original_image[y:y+h, x:x+w]
-            
-            candidate = {
-                'id': i,
-                'bbox': (x, y, w, h),
-                'mask': roi,
-                'original_roi': original_roi,
-                'contour': main_contour,
-                'area': cv2.contourArea(main_contour)
-            }
-            
-            candidates.append(candidate)
+                # 创建笔触对象
+                stroke = self._create_stroke_from_contour(stroke_id, contour, mask)
+                if stroke:
+                    strokes.append(stroke)
+                    stroke_id += 1
         
-        return candidates
+        return strokes
     
-    def _validate_and_extract_features(self, candidates: List[Dict], 
-                                     original_image: np.ndarray) -> List[Stroke]:
-        """
-        验证候选区域并提取特征
-        
-        Args:
-            candidates (List[Dict]): 笔画候选区域
-            original_image (np.ndarray): 原始图像
-            
-        Returns:
-            List[Stroke]: 验证后的笔画列表
-        """
+    def _contours_to_strokes(self, contours: List[np.ndarray], 
+                            binary_image: np.ndarray) -> List[Stroke]:
+        """将轮廓转换为笔触"""
         strokes = []
         
-        for candidate in candidates:
-            try:
-                # 提取骨架
-                skeleton = self.skeleton_extractor.extract_skeleton(candidate['mask'])
-                if skeleton is None or len(skeleton) < self.min_stroke_length:
+        for i, contour in enumerate(contours):
+            if cv2.contourArea(contour) >= self.config['contour_min_area']:
+                # 创建掩码
+                mask = np.zeros(binary_image.shape, dtype=np.uint8)
+                cv2.fillPoly(mask, [contour], 255)
+                
+                # 创建笔触对象
+                stroke = self._create_stroke_from_contour(i, contour, mask)
+                if stroke:
+                    strokes.append(stroke)
+        
+        return strokes
+    
+    def _create_stroke_from_contour(self, stroke_id: int, contour: np.ndarray, 
+                                   mask: np.ndarray) -> Optional[Stroke]:
+        """从轮廓创建笔触对象"""
+        try:
+            # 基本几何属性
+            area = cv2.contourArea(contour)
+            perimeter = cv2.arcLength(contour, True)
+            
+            if area < self.config['contour_min_area']:
+                return None
+            
+            # 边界框
+            x, y, w, h = cv2.boundingRect(contour)
+            bbox = (x, y, w, h)
+            
+            # 中心点
+            M = cv2.moments(contour)
+            if M['m00'] != 0:
+                center = (M['m10'] / M['m00'], M['m01'] / M['m00'])
+            else:
+                center = (x + w/2, y + h/2)
+            
+            # 拟合椭圆获取长度、宽度和角度
+            if len(contour) >= 5:
+                ellipse = cv2.fitEllipse(contour)
+                length = max(ellipse[1])
+                width = min(ellipse[1])
+                angle = ellipse[2]
+            else:
+                length = max(w, h)
+                width = min(w, h)
+                angle = 0
+            
+            # 检查笔触尺寸
+            if (length < self.config['min_stroke_length'] or 
+                width > self.config['max_stroke_width']):
+                return None
+            
+            # 计算置信度
+            confidence = self._calculate_stroke_confidence(contour, area, perimeter)
+            
+            # 提取特征
+            features = self._extract_stroke_features(contour, mask)
+            
+            return Stroke(
+                id=stroke_id,
+                contour=contour,
+                mask=mask,
+                bbox=bbox,
+                center=center,
+                area=area,
+                perimeter=perimeter,
+                length=length,
+                width=width,
+                angle=angle,
+                confidence=confidence,
+                features=features
+            )
+            
+        except Exception as e:
+            print(f"Error creating stroke from contour: {e}")
+            return None
+    
+    def _calculate_stroke_confidence(self, contour: np.ndarray, 
+                                   area: float, perimeter: float) -> float:
+        """计算笔触置信度"""
+        try:
+            # 基于形状规律性的置信度
+            hull = cv2.convexHull(contour)
+            hull_area = cv2.contourArea(hull)
+            
+            if hull_area > 0:
+                solidity = area / hull_area
+            else:
+                solidity = 0
+            
+            # 基于长宽比的置信度
+            if len(contour) >= 5:
+                ellipse = cv2.fitEllipse(contour)
+                aspect_ratio = max(ellipse[1]) / (min(ellipse[1]) + 1e-6)
+                aspect_confidence = min(aspect_ratio / 10.0, 1.0)  # 偏好细长形状
+            else:
+                aspect_confidence = 0.5
+            
+            # 综合置信度
+            confidence = (solidity * 0.5 + aspect_confidence * 0.5)
+            return max(0.0, min(1.0, confidence))
+            
+        except Exception:
+            return 0.5
+    
+    def _extract_stroke_features(self, contour: np.ndarray, 
+                               mask: np.ndarray) -> Dict[str, Any]:
+        """提取笔触特征"""
+        features = {}
+        
+        try:
+            # 形状特征
+            area = cv2.contourArea(contour)
+            perimeter = cv2.arcLength(contour, True)
+            
+            if perimeter > 0:
+                features['circularity'] = 4 * np.pi * area / (perimeter ** 2)
+            else:
+                features['circularity'] = 0
+            
+            # 凸包特征
+            hull = cv2.convexHull(contour)
+            hull_area = cv2.contourArea(hull)
+            if hull_area > 0:
+                features['solidity'] = area / hull_area
+            else:
+                features['solidity'] = 0
+            
+            # 椭圆拟合特征
+            if len(contour) >= 5:
+                ellipse = cv2.fitEllipse(contour)
+                features['ellipse_center'] = ellipse[0]
+                features['ellipse_axes'] = ellipse[1]
+                features['ellipse_angle'] = ellipse[2]
+                features['aspect_ratio'] = max(ellipse[1]) / (min(ellipse[1]) + 1e-6)
+            
+            # 边界框特征
+            x, y, w, h = cv2.boundingRect(contour)
+            features['bbox_aspect_ratio'] = w / (h + 1e-6)
+            features['extent'] = area / (w * h)
+            
+        except Exception as e:
+            print(f"Error extracting stroke features: {e}")
+        
+        return features
+    
+    def _merge_duplicate_strokes(self, strokes: List[Stroke]) -> List[Stroke]:
+        """合并重复的笔触"""
+        if not strokes:
+            return strokes
+        
+        merged_strokes = []
+        used_indices = set()
+        
+        for i, stroke1 in enumerate(strokes):
+            if i in used_indices:
+                continue
+            
+            # 查找重叠的笔触
+            overlapping_strokes = [stroke1]
+            used_indices.add(i)
+            
+            for j, stroke2 in enumerate(strokes[i+1:], i+1):
+                if j in used_indices:
                     continue
                 
-                # 分析轮廓
-                contour_info = self.contour_analyzer.analyze_contour(
-                    candidate['contour'], candidate['original_roi']
-                )
-                
-                # 计算宽度变化
-                width_profile = self._compute_width_profile(
-                    skeleton, candidate['mask']
-                )
-                
-                # 计算纹理变化
-                texture_profile = self._compute_texture_profile(
-                    skeleton, candidate['original_roi']
-                )
-                
-                # 计算几何特征
-                length = self._compute_stroke_length(skeleton)
-                orientation = self._compute_orientation(skeleton)
-                
-                # 创建笔画对象
-                stroke = Stroke(
-                    id=candidate['id'],
-                    skeleton=skeleton,
-                    contour=candidate['contour'],
-                    width_profile=width_profile,
-                    texture_profile=texture_profile,
-                    bbox=candidate['bbox'],
-                    area=candidate['area'],
-                    length=length,
-                    orientation=orientation,
-                    confidence=self._compute_confidence(candidate, skeleton)
-                )
-                
-                strokes.append(stroke)
-                
-            except Exception as e:
-                print(f"处理候选笔画 {candidate['id']} 时发生错误: {str(e)}")
-                continue
-        
-        return strokes
-    
-    def _compute_width_profile(self, skeleton: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """
-        计算沿骨架的宽度变化
-        
-        Args:
-            skeleton (np.ndarray): 骨架点序列
-            mask (np.ndarray): 笔画掩码
+                if self._strokes_overlap(stroke1, stroke2):
+                    overlapping_strokes.append(stroke2)
+                    used_indices.add(j)
             
-        Returns:
-            np.ndarray: 宽度变化曲线
-        """
-        width_profile = []
-        
-        for i in range(len(skeleton)):
-            point = skeleton[i]
-            
-            # 计算垂直于骨架方向的宽度
-            if i == 0:
-                direction = skeleton[i+1] - skeleton[i]
-            elif i == len(skeleton) - 1:
-                direction = skeleton[i] - skeleton[i-1]
+            # 合并重叠的笔触
+            if len(overlapping_strokes) > 1:
+                merged_stroke = self._merge_strokes(overlapping_strokes)
+                if merged_stroke:
+                    merged_strokes.append(merged_stroke)
             else:
-                direction = skeleton[i+1] - skeleton[i-1]
-            
-            # 垂直方向
-            perpendicular = np.array([-direction[1], direction[0]])
-            if np.linalg.norm(perpendicular) > 0:
-                perpendicular = perpendicular / np.linalg.norm(perpendicular)
-            
-            # 沿垂直方向测量宽度
-            width = self._measure_width_at_point(point, perpendicular, mask)
-            width_profile.append(width)
+                merged_strokes.append(stroke1)
         
-        return np.array(width_profile)
+        return merged_strokes
     
-    def _measure_width_at_point(self, point: np.ndarray, direction: np.ndarray, 
-                               mask: np.ndarray) -> float:
-        """
-        在指定点沿指定方向测量宽度
+    def _strokes_overlap(self, stroke1: Stroke, stroke2: Stroke, 
+                        threshold: float = 0.3) -> bool:
+        """检查两个笔触是否重叠"""
+        # 检查边界框重叠
+        x1, y1, w1, h1 = stroke1.bbox
+        x2, y2, w2, h2 = stroke2.bbox
         
-        Args:
-            point (np.ndarray): 测量点
-            direction (np.ndarray): 测量方向
-            mask (np.ndarray): 笔画掩码
-            
-        Returns:
-            float: 测量的宽度
-        """
-        max_distance = min(mask.shape) // 2
-        width = 0
+        # 计算重叠区域
+        overlap_x = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
+        overlap_y = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
+        overlap_area = overlap_x * overlap_y
         
-        # 向两个方向搜索边界
-        for sign in [-1, 1]:
-            for distance in range(1, max_distance):
-                test_point = point + sign * distance * direction
-                x, y = int(test_point[0]), int(test_point[1])
-                
-                if (0 <= x < mask.shape[1] and 0 <= y < mask.shape[0]):
-                    if mask[y, x] == 0:  # 到达边界
-                        width += distance
-                        break
-                else:
-                    width += distance
-                    break
+        # 计算重叠比例
+        area1 = w1 * h1
+        area2 = w2 * h2
+        min_area = min(area1, area2)
         
-        return width
+        if min_area > 0:
+            overlap_ratio = overlap_area / min_area
+            return overlap_ratio > threshold
+        
+        return False
     
-    def _compute_texture_profile(self, skeleton: np.ndarray, 
-                               original_roi: np.ndarray) -> np.ndarray:
-        """
-        计算沿骨架的纹理变化
+    def _merge_strokes(self, strokes: List[Stroke]) -> Optional[Stroke]:
+        """合并多个笔触"""
+        if not strokes:
+            return None
         
-        Args:
-            skeleton (np.ndarray): 骨架点序列
-            original_roi (np.ndarray): 原始图像区域
+        if len(strokes) == 1:
+            return strokes[0]
+        
+        try:
+            # 合并轮廓
+            all_points = np.vstack([stroke.contour for stroke in strokes])
+            merged_contour = cv2.convexHull(all_points)
             
-        Returns:
-            np.ndarray: 纹理变化曲线
-        """
-        texture_profile = []
-        window_size = 5
-        
-        for point in skeleton:
-            x, y = int(point[0]), int(point[1])
+            # 创建合并的掩码
+            mask_shape = strokes[0].mask.shape
+            merged_mask = np.zeros(mask_shape, dtype=np.uint8)
             
-            # 提取局部窗口
-            x1 = max(0, x - window_size // 2)
-            y1 = max(0, y - window_size // 2)
-            x2 = min(original_roi.shape[1], x + window_size // 2 + 1)
-            y2 = min(original_roi.shape[0], y + window_size // 2 + 1)
+            for stroke in strokes:
+                merged_mask = cv2.bitwise_or(merged_mask, stroke.mask)
             
-            window = original_roi[y1:y2, x1:x2]
+            # 创建新的笔触对象
+            return self._create_stroke_from_contour(
+                strokes[0].id, merged_contour, merged_mask
+            )
             
-            if window.size > 0:
-                # 计算局部纹理特征（标准差）
-                texture_value = np.std(window.astype(np.float32))
-            else:
-                texture_value = 0
-            
-            texture_profile.append(texture_value)
-        
-        return np.array(texture_profile)
-    
-    def _compute_stroke_length(self, skeleton: np.ndarray) -> float:
-        """
-        计算笔画长度
-        
-        Args:
-            skeleton (np.ndarray): 骨架点序列
-            
-        Returns:
-            float: 笔画长度
-        """
-        if len(skeleton) < 2:
-            return 0
-        
-        total_length = 0
-        for i in range(1, len(skeleton)):
-            distance = np.linalg.norm(skeleton[i] - skeleton[i-1])
-            total_length += distance
-        
-        return total_length
-    
-    def _compute_orientation(self, skeleton: np.ndarray) -> float:
-        """
-        计算笔画主方向
-        
-        Args:
-            skeleton (np.ndarray): 骨架点序列
-            
-        Returns:
-            float: 主方向角度（弧度）
-        """
-        if len(skeleton) < 2:
-            return 0
-        
-        # 使用起点和终点计算主方向
-        start_point = skeleton[0]
-        end_point = skeleton[-1]
-        direction = end_point - start_point
-        
-        angle = np.arctan2(direction[1], direction[0])
-        return angle
-    
-    def _compute_confidence(self, candidate: Dict, skeleton: np.ndarray) -> float:
-        """
-        计算笔画检测置信度
-        
-        Args:
-            candidate (Dict): 候选笔画信息
-            skeleton (np.ndarray): 骨架点序列
-            
-        Returns:
-            float: 置信度分数 (0-1)
-        """
-        # 基于多个因素计算置信度
-        factors = []
-        
-        # 1. 长度因子
-        length = len(skeleton)
-        length_factor = min(1.0, length / (self.min_stroke_length * 2))
-        factors.append(length_factor)
-        
-        # 2. 面积因子
-        area = candidate['area']
-        area_factor = min(1.0, area / 100)  # 假设合理面积为100像素
-        factors.append(area_factor)
-        
-        # 3. 形状因子（长宽比）
-        x, y, w, h = candidate['bbox']
-        aspect_ratio = max(w, h) / max(min(w, h), 1)
-        shape_factor = min(1.0, aspect_ratio / 10)  # 笔画通常是细长的
-        factors.append(shape_factor)
-        
-        # 计算综合置信度
-        confidence = np.mean(factors)
-        return confidence
-    
-    def _classify_strokes(self, strokes: List[Stroke]) -> List[Stroke]:
-        """
-        对笔画进行分类
-        
-        Args:
-            strokes (List[Stroke]): 输入笔画列表
-            
-        Returns:
-            List[Stroke]: 分类后的笔画列表
-        """
-        for stroke in strokes:
-            # 基于几何特征进行简单分类
-            stroke.stroke_type = self._classify_single_stroke(stroke)
-        
-        return strokes
-    
-    def _classify_single_stroke(self, stroke: Stroke) -> str:
-        """
-        对单个笔画进行分类
-        
-        Args:
-            stroke (Stroke): 输入笔画
-            
-        Returns:
-            str: 笔画类型
-        """
-        # 简单的基于角度和长度的分类
-        angle = abs(stroke.orientation)
-        length = stroke.length
-        x, y, w, h = stroke.bbox
-        aspect_ratio = max(w, h) / max(min(w, h), 1)
-        
-        # 基于角度判断方向
-        if angle < np.pi / 8 or angle > 7 * np.pi / 8:  # 接近水平
-            if aspect_ratio > 3:
-                return "horizontal"
-        elif np.pi * 3 / 8 < angle < np.pi * 5 / 8:  # 接近垂直
-            if aspect_ratio > 3:
-                return "vertical"
-        
-        # 基于长度判断类型
-        if length < 20:
-            return "dot"
-        elif length > 100:
-            return "long_stroke"
-        else:
-            return "medium_stroke"
-    
-    def visualize_detection_results(self, image: np.ndarray, strokes: List[Stroke]) -> np.ndarray:
-        """
-        可视化检测结果
-        
-        Args:
-            image (np.ndarray): 原始图像
-            strokes (List[Stroke]): 检测到的笔画
-            
-        Returns:
-            np.ndarray: 可视化图像
-        """
-        vis_image = image.copy()
-        if len(vis_image.shape) == 2:
-            vis_image = cv2.cvtColor(vis_image, cv2.COLOR_GRAY2BGR)
-        
-        colors = [
-            (0, 255, 0),    # 绿色
-            (255, 0, 0),    # 蓝色
-            (0, 0, 255),    # 红色
-            (255, 255, 0),  # 青色
-            (255, 0, 255),  # 品红
-            (0, 255, 255),  # 黄色
-        ]
-        
-        for i, stroke in enumerate(strokes):
-            color = colors[i % len(colors)]
-            
-            # 绘制边界框
-            x, y, w, h = stroke.bbox
-            cv2.rectangle(vis_image, (x, y), (x + w, y + h), color, 2)
-            
-            # 绘制骨架
-            if len(stroke.skeleton) > 1:
-                for j in range(1, len(stroke.skeleton)):
-                    pt1 = tuple(stroke.skeleton[j-1].astype(int))
-                    pt2 = tuple(stroke.skeleton[j].astype(int))
-                    cv2.line(vis_image, pt1, pt2, color, 2)
-            
-            # 添加标签
-            cv2.putText(vis_image, f"{i}:{stroke.stroke_type}", 
-                       (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        
-        return vis_image
+        except Exception as e:
+            print(f"Error merging strokes: {e}")
+            return strokes[0]  # 返回第一个笔触作为备选

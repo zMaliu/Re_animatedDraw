@@ -1,1024 +1,632 @@
 # -*- coding: utf-8 -*-
 """
-绘画动画器
+绘画动画器模块
 
-实现中国画笔刷绘制动画生成
-包括笔画轨迹生成、时间控制、动画渲染等功能
+提供绘画动画的生成和控制功能
 """
 
 import numpy as np
-import cv2
-from typing import Dict, List, Tuple, Optional, Any, Callable
+from typing import List, Dict, Any, Tuple, Optional, Callable
 from dataclasses import dataclass
 import logging
 import time
-import math
-from scipy.interpolate import interp1d, splprep, splev
-from scipy.spatial.distance import cdist
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-from matplotlib.patches import Circle
-import json
-import os
+from enum import Enum
+from ..stroke_extraction.stroke_detector import Stroke
+from .stroke_animator import StrokeAnimator, AnimationMode
+from .direction_detector import DirectionDetector
+from .animation_controller import AnimationController
+
+
+class AnimationStyle(Enum):
+    """动画风格"""
+    REALISTIC = "realistic"  # 写实风格
+    ARTISTIC = "artistic"  # 艺术风格
+    SKETCH = "sketch"  # 素描风格
+    CALLIGRAPHY = "calligraphy"  # 书法风格
+    WATERCOLOR = "watercolor"  # 水彩风格
+
+
+class PaintingSpeed(Enum):
+    """绘画速度"""
+    VERY_SLOW = 0.2
+    SLOW = 0.5
+    NORMAL = 1.0
+    FAST = 2.0
+    VERY_FAST = 5.0
+
+
+@dataclass
+class AnimationConfig:
+    """动画配置"""
+    fps: int = 30
+    duration: float = 10.0
+    resolution: Tuple[int, int] = (1920, 1080)
+    background_color: Tuple[int, int, int] = (255, 255, 255)
+    style: AnimationStyle = AnimationStyle.REALISTIC
+    speed: PaintingSpeed = PaintingSpeed.NORMAL
+    show_brush: bool = True
+    show_progress: bool = True
+    enable_effects: bool = True
+    smooth_transitions: bool = True
 
 
 @dataclass
 class AnimationFrame:
-    """
-    动画帧数据结构
-    
-    Attributes:
-        frame_id (int): 帧ID
-        timestamp (float): 时间戳
-        brush_position (Tuple[float, float]): 笔刷位置
-        brush_pressure (float): 笔刷压力
-        brush_angle (float): 笔刷角度
-        brush_size (float): 笔刷大小
-        ink_flow (float): 墨水流量
-        stroke_progress (float): 笔画进度
-        canvas_state (np.ndarray): 画布状态
-        metadata (Dict): 元数据
-    """
-    frame_id: int
+    """动画帧"""
+    frame_number: int
     timestamp: float
-    brush_position: Tuple[float, float]
+    canvas_state: np.ndarray
+    active_strokes: List[int]
+    brush_position: Optional[Tuple[float, float]]
     brush_pressure: float
-    brush_angle: float
-    brush_size: float
-    ink_flow: float
-    stroke_progress: float
-    canvas_state: Optional[np.ndarray]
     metadata: Dict[str, Any]
 
 
 @dataclass
-class StrokeAnimation:
-    """
-    笔画动画数据结构
-    
-    Attributes:
-        stroke_id (int): 笔画ID
-        trajectory (List[Tuple[float, float]]): 轨迹点列表
-        timing (List[float]): 时间点列表
-        pressure_curve (List[float]): 压力曲线
-        velocity_curve (List[float]): 速度曲线
-        brush_size_curve (List[float]): 笔刷大小曲线
-        ink_flow_curve (List[float]): 墨水流量曲线
-        duration (float): 持续时间
-        frames (List[AnimationFrame]): 动画帧列表
-        metadata (Dict): 元数据
-    """
-    stroke_id: int
-    trajectory: List[Tuple[float, float]]
-    timing: List[float]
-    pressure_curve: List[float]
-    velocity_curve: List[float]
-    brush_size_curve: List[float]
-    ink_flow_curve: List[float]
-    duration: float
+class AnimationSequence:
+    """动画序列"""
     frames: List[AnimationFrame]
-    metadata: Dict[str, Any]
-
-
-@dataclass
-class PaintingAnimation:
-    """
-    绘画动画数据结构
-    
-    Attributes:
-        animation_id (str): 动画ID
-        stroke_animations (List[StrokeAnimation]): 笔画动画列表
-        total_duration (float): 总持续时间
-        fps (int): 帧率
-        canvas_size (Tuple[int, int]): 画布大小
-        background_color (Tuple[int, int, int]): 背景颜色
-        all_frames (List[AnimationFrame]): 所有动画帧
-        metadata (Dict): 元数据
-    """
-    animation_id: str
-    stroke_animations: List[StrokeAnimation]
     total_duration: float
     fps: int
-    canvas_size: Tuple[int, int]
-    background_color: Tuple[int, int, int]
-    all_frames: List[AnimationFrame]
+    resolution: Tuple[int, int]
     metadata: Dict[str, Any]
 
 
 class PaintingAnimator:
-    """
-    绘画动画器
+    """绘画动画器"""
     
-    生成中国画笔刷绘制动画
-    """
-    
-    def __init__(self, config):
+    def __init__(self, config: Dict[str, Any]):
         """
         初始化绘画动画器
         
         Args:
-            config: 配置对象
+            config: 配置参数
         """
         self.config = config
         self.logger = logging.getLogger(__name__)
         
-        # 动画参数
-        self.fps = config['animation'].get('fps', 30)
-        self.canvas_size = tuple(config['animation'].get('canvas_size', (800, 600)))
-        self.background_color = tuple(config['animation'].get('background_color', (255, 255, 255)))
+        # 动画配置
+        self.animation_config = AnimationConfig(
+            fps=config.get('fps', 30),
+            duration=config.get('duration', 10.0),
+            resolution=tuple(config.get('resolution', (1920, 1080))),
+            background_color=tuple(config.get('background_color', (255, 255, 255))),
+            style=AnimationStyle(config.get('style', 'realistic')),
+            speed=PaintingSpeed(config.get('speed', 1.0)),
+            show_brush=config.get('show_brush', True),
+            show_progress=config.get('show_progress', True),
+            enable_effects=config.get('enable_effects', True),
+            smooth_transitions=config.get('smooth_transitions', True)
+        )
         
-        # 笔刷参数
-        self.default_brush_size = config['animation'].get('default_brush_size', 5)
-        self.min_brush_size = config['animation'].get('min_brush_size', 1)
-        self.max_brush_size = config['animation'].get('max_brush_size', 20)
+        # 初始化组件
+        self.stroke_animator = StrokeAnimator(config)
+        self.direction_detector = DirectionDetector(config)
+        self.animation_controller = AnimationController(config)
         
-        # 时间参数
-        self.stroke_duration_base = config['animation'].get('stroke_duration_base', 2.0)
-        self.pause_between_strokes = config['animation'].get('pause_between_strokes', 0.5)
-        self.speed_variation = config['animation'].get('speed_variation', 0.3)
+        # 动画状态
+        self.current_sequence = None
+        self.is_animating = False
+        self.animation_progress = 0.0
         
-        # 物理参数
-        self.pressure_sensitivity = config['animation'].get('pressure_sensitivity', 0.8)
-        self.ink_flow_rate = config['animation'].get('ink_flow_rate', 0.7)
-        self.brush_elasticity = config['animation'].get('brush_elasticity', 0.5)
+        # 缓存
+        self.frame_cache = {}
+        self.stroke_cache = {}
         
-        # 插值参数
-        self.trajectory_smoothness = config['animation'].get('trajectory_smoothness', 0.1)
-        self.curve_resolution = config['animation'].get('curve_resolution', 100)
-        
-        # 渲染参数
-        self.enable_brush_texture = config['animation'].get('enable_brush_texture', True)
-        self.enable_ink_diffusion = config['animation'].get('enable_ink_diffusion', True)
-        self.enable_paper_texture = config['animation'].get('enable_paper_texture', False)
-    
-    def create_animation(self, strokes: List[Dict[str, Any]], 
-                        stroke_order: List[int]) -> PaintingAnimation:
+    def create_animation(self, strokes: List[Stroke], 
+                        reference_image: np.ndarray = None,
+                        custom_config: AnimationConfig = None) -> AnimationSequence:
         """
         创建绘画动画
         
         Args:
-            strokes (List[Dict]): 笔画列表
-            stroke_order (List[int]): 笔画顺序
+            strokes: 笔触列表
+            reference_image: 参考图像
+            custom_config: 自定义动画配置
             
         Returns:
-            PaintingAnimation: 绘画动画
+            动画序列
         """
-        try:
-            self.logger.info(f"Creating animation for {len(strokes)} strokes")
-            
-            # 生成笔画动画
-            stroke_animations = []
-            current_time = 0.0
-            
-            for i, stroke_idx in enumerate(stroke_order):
-                if stroke_idx < len(strokes):
-                    stroke = strokes[stroke_idx]
-                    
-                    # 生成单个笔画动画
-                    stroke_anim = self._create_stroke_animation(
-                        stroke, i, current_time
-                    )
-                    
-                    stroke_animations.append(stroke_anim)
-                    current_time += stroke_anim.duration + self.pause_between_strokes
-            
-            # 生成完整动画
-            total_duration = current_time - self.pause_between_strokes
-            all_frames = self._combine_stroke_animations(stroke_animations)
-            
-            animation_id = f"painting_animation_{int(time.time())}"
-            
-            painting_animation = PaintingAnimation(
-                animation_id=animation_id,
-                stroke_animations=stroke_animations,
-                total_duration=total_duration,
-                fps=self.fps,
-                canvas_size=self.canvas_size,
-                background_color=self.background_color,
-                all_frames=all_frames,
-                metadata={
-                    'num_strokes': len(stroke_animations),
-                    'total_frames': len(all_frames),
-                    'creation_time': time.time(),
-                    'config': {
-                        'fps': self.fps,
-                        'canvas_size': self.canvas_size,
-                        'stroke_duration_base': self.stroke_duration_base
-                    }
-                }
+        if not strokes:
+            return AnimationSequence(
+                frames=[],
+                total_duration=0.0,
+                fps=self.animation_config.fps,
+                resolution=self.animation_config.resolution,
+                metadata={'error': 'No strokes provided'}
             )
-            
-            self.logger.info(f"Animation created: {total_duration:.2f}s, {len(all_frames)} frames")
-            
-            return painting_animation
-            
-        except Exception as e:
-            self.logger.error(f"Error creating animation: {str(e)}")
-            return self._create_default_animation(strokes)
-    
-    def _create_stroke_animation(self, stroke: Dict[str, Any], 
-                               stroke_index: int, start_time: float) -> StrokeAnimation:
-        """
-        创建单个笔画动画
         
-        Args:
-            stroke (Dict): 笔画数据
-            stroke_index (int): 笔画索引
-            start_time (float): 开始时间
-            
-        Returns:
-            StrokeAnimation: 笔画动画
-        """
+        # 使用自定义配置或默认配置
+        config = custom_config or self.animation_config
+        
         try:
-            # 提取笔画轨迹
-            trajectory = self._extract_stroke_trajectory(stroke)
+            self.logger.info(f"Creating animation with {len(strokes)} strokes")
             
-            # 计算动画持续时间
-            duration = self._calculate_stroke_duration(stroke)
+            # 计算动画时间线
+            timeline = self._calculate_timeline(strokes, config)
             
-            # 生成时间轴
-            timing = self._generate_timing_curve(trajectory, duration)
-            
-            # 生成动画曲线
-            pressure_curve = self._generate_pressure_curve(trajectory, timing)
-            velocity_curve = self._generate_velocity_curve(trajectory, timing)
-            brush_size_curve = self._generate_brush_size_curve(pressure_curve)
-            ink_flow_curve = self._generate_ink_flow_curve(velocity_curve, pressure_curve)
+            # 初始化画布
+            canvas = self._initialize_canvas(config, reference_image)
             
             # 生成动画帧
-            frames = self._generate_stroke_frames(
-                trajectory, timing, pressure_curve, velocity_curve,
-                brush_size_curve, ink_flow_curve, start_time, stroke_index
-            )
+            frames = self._generate_frames(strokes, timeline, canvas, config)
             
-            return StrokeAnimation(
-                stroke_id=stroke_index,
-                trajectory=trajectory,
-                timing=timing,
-                pressure_curve=pressure_curve,
-                velocity_curve=velocity_curve,
-                brush_size_curve=brush_size_curve,
-                ink_flow_curve=ink_flow_curve,
-                duration=duration,
+            # 创建动画序列
+            sequence = AnimationSequence(
                 frames=frames,
+                total_duration=config.duration,
+                fps=config.fps,
+                resolution=config.resolution,
                 metadata={
-                    'stroke_type': stroke.get('stroke_class', 'unknown'),
-                    'complexity': stroke.get('complexity', 1.0),
-                    'length': stroke.get('arc_length', 0),
-                    'start_time': start_time
+                    'num_strokes': len(strokes),
+                    'num_frames': len(frames),
+                    'style': config.style.value,
+                    'speed': config.speed.value,
+                    'creation_time': time.time()
                 }
             )
             
-        except Exception as e:
-            self.logger.error(f"Error creating stroke animation: {str(e)}")
-            return self._create_default_stroke_animation(stroke_index, start_time)
-    
-    def _extract_stroke_trajectory(self, stroke: Dict[str, Any]) -> List[Tuple[float, float]]:
-        """
-        提取笔画轨迹
-        
-        Args:
-            stroke (Dict): 笔画数据
+            self.current_sequence = sequence
+            self.logger.info(f"Animation created: {len(frames)} frames, {config.duration:.2f}s")
             
-        Returns:
-            List[Tuple[float, float]]: 轨迹点列表
-        """
-        try:
-            # 优先使用骨架作为轨迹
-            skeleton = stroke.get('skeleton', [])
-            # 安全检查skeleton是否有效
-            skeleton_valid = False
-            if isinstance(skeleton, np.ndarray):
-                skeleton_valid = skeleton.size > 0 and len(skeleton) > 1
-            elif isinstance(skeleton, list):
-                skeleton_valid = len(skeleton) > 1
-            else:
-                skeleton_valid = bool(skeleton) and len(skeleton) > 1 if hasattr(skeleton, '__len__') else False
-                
-            if skeleton_valid:
-                trajectory = [(float(p[0]), float(p[1])) for p in skeleton]
-            else:
-                # 使用轮廓中心线
-                contour = stroke.get('contour', [])
-                # 安全检查contour是否有效
-                contour_valid = False
-                if isinstance(contour, np.ndarray):
-                    contour_valid = contour.size > 0 and len(contour) > 1
-                elif isinstance(contour, list):
-                    contour_valid = len(contour) > 1
-                else:
-                    contour_valid = bool(contour) and len(contour) > 1 if hasattr(contour, '__len__') else False
-                    
-                if contour_valid:
-                    # 简化轮廓为中心线
-                    trajectory = self._contour_to_centerline(contour)
-                else:
-                    # 使用边界框生成简单轨迹
-                    bbox = stroke.get('bounding_rect', (0, 0, 100, 20))
-                    trajectory = self._bbox_to_trajectory(bbox, stroke.get('stroke_class', 'horizontal'))
-            
-            # 平滑轨迹
-            if len(trajectory) > 2:
-                trajectory = self._smooth_trajectory(trajectory)
-            
-            return trajectory
+            return sequence
             
         except Exception as e:
-            self.logger.error(f"Error extracting stroke trajectory: {str(e)}")
-            # 返回默认轨迹
-            return [(0, 0), (100, 0)]
+            self.logger.error(f"Error creating animation: {e}")
+            return AnimationSequence(
+                frames=[],
+                total_duration=0.0,
+                fps=config.fps,
+                resolution=config.resolution,
+                metadata={'error': str(e)}
+            )
     
-    def _contour_to_centerline(self, contour: List[Tuple[int, int]]) -> List[Tuple[float, float]]:
+    def animate_stroke_sequence(self, strokes: List[Stroke], 
+                               timing_info: Dict[str, Any] = None) -> AnimationSequence:
         """
-        将轮廓转换为中心线
+        为笔触序列创建动画
         
         Args:
-            contour (List[Tuple[int, int]]): 轮廓点
+            strokes: 笔触列表
+            timing_info: 时间信息
             
         Returns:
-            List[Tuple[float, float]]: 中心线点
+            动画序列
         """
-        try:
-            if len(contour) < 3:
-                return [(float(p[0]), float(p[1])) for p in contour]
-            
-            # 转换为numpy数组
-            contour_array = np.array(contour)
-            
-            # 计算轮廓的主轴方向
-            centroid = np.mean(contour_array, axis=0)
-            
-            # 使用PCA找到主方向
-            centered = contour_array - centroid
-            cov_matrix = np.cov(centered.T)
-            eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
-            
-            # 主方向向量
-            main_direction = eigenvectors[:, np.argmax(eigenvalues)]
-            
-            # 投影到主方向
-            projections = np.dot(centered, main_direction)
-            
-            # 排序并生成中心线
-            sorted_indices = np.argsort(projections)
-            
-            # 采样点
-            num_points = min(20, len(contour) // 2)
-            step = len(sorted_indices) // num_points if num_points > 0 else 1
-            
-            centerline = []
-            for i in range(0, len(sorted_indices), step):
-                idx = sorted_indices[i]
-                centerline.append((float(contour_array[idx][0]), float(contour_array[idx][1])))
-            
-            return centerline
-            
-        except Exception as e:
-            self.logger.error(f"Error converting contour to centerline: {str(e)}")
-            return [(float(contour[0][0]), float(contour[0][1])), 
-                   (float(contour[-1][0]), float(contour[-1][1]))]
-    
-    def _bbox_to_trajectory(self, bbox: Tuple[int, int, int, int], 
-                          stroke_type: str) -> List[Tuple[float, float]]:
-        """
-        根据边界框生成轨迹
+        # 计算每个笔触的动画时间
+        stroke_timings = self._calculate_stroke_timings(strokes, timing_info)
         
-        Args:
-            bbox (Tuple[int, int, int, int]): 边界框 (x, y, w, h)
-            stroke_type (str): 笔画类型
-            
-        Returns:
-            List[Tuple[float, float]]: 轨迹点
-        """
-        try:
-            x, y, w, h = bbox
-            
-            if stroke_type == 'horizontal':
-                # 水平笔画：从左到右
-                return [(float(x), float(y + h // 2)), (float(x + w), float(y + h // 2))]
-            elif stroke_type == 'vertical':
-                # 垂直笔画：从上到下
-                return [(float(x + w // 2), float(y)), (float(x + w // 2), float(y + h))]
-            elif stroke_type == 'left_falling':
-                # 撇：从右上到左下
-                return [(float(x + w), float(y)), (float(x), float(y + h))]
-            elif stroke_type == 'right_falling':
-                # 捺：从左上到右下
-                return [(float(x), float(y)), (float(x + w), float(y + h))]
-            elif stroke_type == 'dot':
-                # 点：中心点
-                center = (float(x + w // 2), float(y + h // 2))
-                return [center, center]
-            else:
-                # 默认：对角线
-                return [(float(x), float(y)), (float(x + w), float(y + h))]
-                
-        except Exception as e:
-            self.logger.error(f"Error generating trajectory from bbox: {str(e)}")
-            return [(0.0, 0.0), (100.0, 0.0)]
-    
-    def _smooth_trajectory(self, trajectory: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-        """
-        平滑轨迹
+        # 为每个笔触生成动画
+        all_frames = []
+        current_time = 0.0
+        canvas = self._initialize_canvas(self.animation_config)
         
-        Args:
-            trajectory (List[Tuple[float, float]]): 原始轨迹
+        for i, stroke in enumerate(strokes):
+            stroke_duration = stroke_timings[i]['duration']
+            stroke_start_time = stroke_timings[i]['start_time']
             
-        Returns:
-            List[Tuple[float, float]]: 平滑后的轨迹
-        """
-        try:
-            if len(trajectory) < 3:
-                return trajectory
-            
-            # 转换为numpy数组
-            points = np.array(trajectory)
-            
-            # 使用样条插值平滑
-            # 计算累积距离作为参数
-            distances = np.cumsum(np.sqrt(np.sum(np.diff(points, axis=0)**2, axis=1)))
-            distances = np.insert(distances, 0, 0)
-            
-            # 归一化距离
-            # 安全比较，避免数组真值歧义
-            last_distance = distances[-1]
-            if isinstance(last_distance, np.ndarray):
-                last_distance_val = last_distance.item() if last_distance.size == 1 else last_distance
-            else:
-                last_distance_val = last_distance
-                
-            if last_distance_val > 0:
-                t = distances / distances[-1]
-            else:
-                t = np.linspace(0, 1, len(points))
-            
-            # 样条插值
-            try:
-                tck, u = splprep([points[:, 0], points[:, 1]], s=self.trajectory_smoothness, k=min(3, len(points)-1))
-                
-                # 生成平滑轨迹
-                u_new = np.linspace(0, 1, self.curve_resolution)
-                smooth_points = splev(u_new, tck)
-                
-                smoothed_trajectory = [(float(x), float(y)) for x, y in zip(smooth_points[0], smooth_points[1])]
-                
-                return smoothed_trajectory
-                
-            except Exception:
-                # 如果样条插值失败，使用线性插值
-                f_x = interp1d(t, points[:, 0], kind='linear')
-                f_y = interp1d(t, points[:, 1], kind='linear')
-                
-                t_new = np.linspace(0, 1, self.curve_resolution)
-                smooth_x = f_x(t_new)
-                smooth_y = f_y(t_new)
-                
-                return [(float(x), float(y)) for x, y in zip(smooth_x, smooth_y)]
-            
-        except Exception as e:
-            self.logger.error(f"Error smoothing trajectory: {str(e)}")
-            return trajectory
-    
-    def _calculate_stroke_duration(self, stroke: Dict[str, Any]) -> float:
-        """
-        计算笔画动画持续时间
-        
-        Args:
-            stroke (Dict): 笔画数据
-            
-        Returns:
-            float: 持续时间（秒）
-        """
-        try:
-            # 基础持续时间
-            base_duration = self.stroke_duration_base
-            
-            # 根据笔画复杂度调整
-            complexity = stroke.get('complexity', 1.0)
-            complexity_factor = 0.5 + complexity * 0.5  # 0.5 到 1.0
-            
-            # 根据笔画长度调整
-            arc_length = stroke.get('arc_length', 100)
-            length_factor = max(0.3, min(2.0, arc_length / 100.0))  # 0.3 到 2.0
-            
-            # 根据笔画类型调整
-            stroke_type = stroke.get('stroke_class', 'horizontal')
-            type_factors = {
-                'dot': 0.3,
-                'horizontal': 0.8,
-                'vertical': 0.9,
-                'left_falling': 1.0,
-                'right_falling': 1.0,
-                'hook': 1.2,
-                'turning': 1.3,
-                'curve': 1.4,
-                'complex': 1.5
+            # 为单个笔触创建动画
+            stroke_dict = {
+                'points': stroke.points if hasattr(stroke, 'points') else [],
+                'features': {
+                    'length': getattr(stroke, 'length', 50),
+                    'complexity': getattr(stroke, 'complexity', 0.5),
+                    'thickness': getattr(stroke, 'thickness', 0.5),
+                    'wetness': getattr(stroke, 'wetness', 0.5)
+                },
+                'color': getattr(stroke, 'color', (0, 0, 0))
             }
-            type_factor = type_factors.get(stroke_type, 1.0)
             
-            # 添加随机变化
-            variation = 1.0 + (np.random.random() - 0.5) * self.speed_variation
+            # 使用stroke_animator创建动画
+            stroke_frames_data = self.stroke_animator.create_animation(
+                [stroke_dict], 
+                [0],  # 单个笔触的顺序
+                AnimationMode.SEQUENTIAL
+            )
             
-            # 计算最终持续时间
-            duration = base_duration * complexity_factor * length_factor * type_factor * variation
-            
-            # 限制在合理范围内
-            duration = max(0.5, min(10.0, duration))
-            
-            return duration
-            
-        except Exception as e:
-            self.logger.error(f"Error calculating stroke duration: {str(e)}")
-            return self.stroke_duration_base
-    
-    def _generate_timing_curve(self, trajectory: List[Tuple[float, float]], 
-                             duration: float) -> List[float]:
-        """
-        生成时间曲线
-        
-        Args:
-            trajectory (List[Tuple[float, float]]): 轨迹点
-            duration (float): 持续时间
-            
-        Returns:
-            List[float]: 时间点列表
-        """
-        try:
-            if len(trajectory) <= 1:
-                return [0.0]
-            
-            # 计算累积距离
-            points = np.array(trajectory)
-            distances = np.cumsum(np.sqrt(np.sum(np.diff(points, axis=0)**2, axis=1)))
-            distances = np.insert(distances, 0, 0)
-            
-            # 归一化距离
-            # 安全比较，避免数组真值歧义
-            last_distance = distances[-1]
-            if isinstance(last_distance, np.ndarray):
-                last_distance_val = last_distance.item() if last_distance.size == 1 else last_distance
-            else:
-                last_distance_val = last_distance
-                
-            if last_distance_val > 0:
-                normalized_distances = distances / distances[-1]
-            else:
-                normalized_distances = np.linspace(0, 1, len(trajectory))
-            
-            # 应用速度变化曲线（起笔慢，中间快，收笔慢）
-            # 使用贝塞尔曲线形状
-            t = normalized_distances
-            speed_curve = 3 * t**2 - 2 * t**3  # S型曲线
-            
-            # 转换为时间
-            timing = speed_curve * duration
-            
-            return timing.tolist()
-            
-        except Exception as e:
-            self.logger.error(f"Error generating timing curve: {str(e)}")
-            return np.linspace(0, duration, len(trajectory)).tolist()
-    
-    def _generate_pressure_curve(self, trajectory: List[Tuple[float, float]], 
-                               timing: List[float]) -> List[float]:
-        """
-        生成压力曲线
-        
-        Args:
-            trajectory (List[Tuple[float, float]]): 轨迹点
-            timing (List[float]): 时间点
-            
-        Returns:
-            List[float]: 压力值列表
-        """
-        try:
-            if len(timing) <= 1:
-                return [0.5]
-            
-            # 归一化时间
-            max_time = max(timing)
-            if max_time > 0:
-                t = np.array(timing) / max_time
-            else:
-                t = np.linspace(0, 1, len(timing))
-            
-            # 生成压力曲线（起笔轻，中间重，收笔轻）
-            # 使用高斯函数的变形
-            pressure = np.exp(-2 * (t - 0.5)**2) * 0.8 + 0.2  # 0.2 到 1.0
-            
-            # 添加细微变化
-            noise = np.random.normal(0, 0.05, len(pressure))
-            pressure = np.clip(pressure + noise, 0.1, 1.0)
-            
-            return pressure.tolist()
-            
-        except Exception as e:
-            self.logger.error(f"Error generating pressure curve: {str(e)}")
-            return [0.5] * len(timing)
-    
-    def _generate_velocity_curve(self, trajectory: List[Tuple[float, float]], 
-                               timing: List[float]) -> List[float]:
-        """
-        生成速度曲线
-        
-        Args:
-            trajectory (List[Tuple[float, float]]): 轨迹点
-            timing (List[float]): 时间点
-            
-        Returns:
-            List[float]: 速度值列表
-        """
-        try:
-            if len(trajectory) <= 1 or len(timing) <= 1:
-                return [1.0]
-            
-            # 计算瞬时速度
-            velocities = [0.0]
-            
-            for i in range(1, len(trajectory)):
-                # 计算距离
-                dx = trajectory[i][0] - trajectory[i-1][0]
-                dy = trajectory[i][1] - trajectory[i-1][1]
-                distance = math.sqrt(dx**2 + dy**2)
-                
-                # 计算时间差
-                dt = timing[i] - timing[i-1]
-                
-                # 计算速度
-                if dt > 0:
-                    velocity = distance / dt
-                else:
-                    velocity = 0.0
-                
-                velocities.append(velocity)
-            
-            # 归一化速度
-            if max(velocities) > 0:
-                velocities = np.array(velocities) / max(velocities)
-            else:
-                velocities = np.ones(len(velocities))
-            
-            # 平滑速度曲线
-            if len(velocities) > 3:
-                from scipy.ndimage import gaussian_filter1d
-                velocities = gaussian_filter1d(velocities, sigma=1.0)
-            
-            return velocities.tolist()
-            
-        except Exception as e:
-            self.logger.error(f"Error generating velocity curve: {str(e)}")
-            return [1.0] * len(timing)
-    
-    def _generate_brush_size_curve(self, pressure_curve: List[float]) -> List[float]:
-        """
-        生成笔刷大小曲线
-        
-        Args:
-            pressure_curve (List[float]): 压力曲线
-            
-        Returns:
-            List[float]: 笔刷大小列表
-        """
-        try:
-            # 基于压力计算笔刷大小
-            brush_sizes = []
-            
-            for pressure in pressure_curve:
-                # 压力越大，笔刷越大
-                size = self.min_brush_size + (self.max_brush_size - self.min_brush_size) * pressure
-                brush_sizes.append(size)
-            
-            return brush_sizes
-            
-        except Exception as e:
-            self.logger.error(f"Error generating brush size curve: {str(e)}")
-            return [self.default_brush_size] * len(pressure_curve)
-    
-    def _generate_ink_flow_curve(self, velocity_curve: List[float], 
-                               pressure_curve: List[float]) -> List[float]:
-        """
-        生成墨水流量曲线
-        
-        Args:
-            velocity_curve (List[float]): 速度曲线
-            pressure_curve (List[float]): 压力曲线
-            
-        Returns:
-            List[float]: 墨水流量列表
-        """
-        try:
-            ink_flows = []
-            
-            for velocity, pressure in zip(velocity_curve, pressure_curve):
-                # 墨水流量与压力正相关，与速度负相关
-                flow = self.ink_flow_rate * pressure * (1.0 - 0.3 * velocity)
-                flow = max(0.1, min(1.0, flow))
-                ink_flows.append(flow)
-            
-            return ink_flows
-            
-        except Exception as e:
-            self.logger.error(f"Error generating ink flow curve: {str(e)}")
-            return [self.ink_flow_rate] * len(velocity_curve)
-    
-    def _generate_stroke_frames(self, trajectory: List[Tuple[float, float]], 
-                              timing: List[float], pressure_curve: List[float],
-                              velocity_curve: List[float], brush_size_curve: List[float],
-                              ink_flow_curve: List[float], start_time: float,
-                              stroke_id: int) -> List[AnimationFrame]:
-        """
-        生成笔画动画帧
-        
-        Args:
-            trajectory (List[Tuple[float, float]]): 轨迹点
-            timing (List[float]): 时间点
-            pressure_curve (List[float]): 压力曲线
-            velocity_curve (List[float]): 速度曲线
-            brush_size_curve (List[float]): 笔刷大小曲线
-            ink_flow_curve (List[float]): 墨水流量曲线
-            start_time (float): 开始时间
-            stroke_id (int): 笔画ID
-            
-        Returns:
-            List[AnimationFrame]: 动画帧列表
-        """
-        try:
-            frames = []
-            
-            for i, (pos, time_offset, pressure, velocity, brush_size, ink_flow) in enumerate(
-                zip(trajectory, timing, pressure_curve, velocity_curve, brush_size_curve, ink_flow_curve)
-            ):
-                
-                # 计算笔刷角度（基于运动方向）
-                if i > 0:
-                    dx = pos[0] - trajectory[i-1][0]
-                    dy = pos[1] - trajectory[i-1][1]
-                    angle = math.atan2(dy, dx)
-                else:
-                    angle = 0.0
-                
-                # 计算笔画进度
-                progress = i / (len(trajectory) - 1) if len(trajectory) > 1 else 1.0
-                
+            # 转换为AnimationFrame格式
+            stroke_frames = []
+            for frame_data in stroke_frames_data:
                 frame = AnimationFrame(
-                    frame_id=len(frames),
-                    timestamp=start_time + time_offset,
-                    brush_position=pos,
-                    brush_pressure=pressure,
-                    brush_angle=angle,
-                    brush_size=brush_size,
-                    ink_flow=ink_flow,
-                    stroke_progress=progress,
-                    canvas_state=None,  # 将在渲染时填充
-                    metadata={
-                        'stroke_id': stroke_id,
-                        'point_index': i,
-                        'velocity': velocity
-                    }
+                    frame_number=frame_data.frame_id,
+                    timestamp=frame_data.timestamp,
+                    canvas_state=frame_data.canvas,
+                    active_strokes=frame_data.active_strokes,
+                    brush_position=None,
+                    brush_pressure=0.0,
+                    metadata=frame_data.metadata
                 )
-                
-                frames.append(frame)
+                stroke_frames.append(frame)
             
-            return frames
+            # 调整帧时间戳
+            for frame in stroke_frames:
+                frame.timestamp += stroke_start_time
+                all_frames.append(frame)
             
-        except Exception as e:
-            self.logger.error(f"Error generating stroke frames: {str(e)}")
-            return []
-    
-    def _combine_stroke_animations(self, stroke_animations: List[StrokeAnimation]) -> List[AnimationFrame]:
-        """
-        合并所有笔画动画帧
+            # 更新画布状态
+            if stroke_frames:
+                canvas = stroke_frames[-1].canvas_state.copy()
         
-        Args:
-            stroke_animations (List[StrokeAnimation]): 笔画动画列表
-            
-        Returns:
-            List[AnimationFrame]: 所有动画帧
-        """
-        try:
-            all_frames = []
-            
-            # 收集所有帧
-            for stroke_anim in stroke_animations:
-                all_frames.extend(stroke_anim.frames)
-            
-            # 按时间戳排序
-            all_frames.sort(key=lambda f: f.timestamp)
-            
-            # 重新分配帧ID
-            for i, frame in enumerate(all_frames):
-                frame.frame_id = i
-            
-            return all_frames
-            
-        except Exception as e:
-            self.logger.error(f"Error combining stroke animations: {str(e)}")
-            return []
-    
-    def save_animation(self, animation: PaintingAnimation, output_path: str) -> bool:
-        """
-        保存动画数据
-        
-        Args:
-            animation (PaintingAnimation): 绘画动画
-            output_path (str): 输出路径
-            
-        Returns:
-            bool: 是否成功
-        """
-        try:
-            # 准备序列化数据
-            animation_data = {
-                'animation_id': animation.animation_id,
-                'total_duration': animation.total_duration,
-                'fps': animation.fps,
-                'canvas_size': animation.canvas_size,
-                'background_color': animation.background_color,
-                'metadata': animation.metadata,
-                'stroke_animations': []
+        return AnimationSequence(
+            frames=all_frames,
+            total_duration=max(f.timestamp for f in all_frames) if all_frames else 0.0,
+            fps=self.animation_config.fps,
+            resolution=self.animation_config.resolution,
+            metadata={
+                'num_strokes': len(strokes),
+                'stroke_timings': stroke_timings
             }
-            
-            # 序列化笔画动画
-            for stroke_anim in animation.stroke_animations:
-                stroke_data = {
-                    'stroke_id': stroke_anim.stroke_id,
-                    'trajectory': stroke_anim.trajectory,
-                    'timing': stroke_anim.timing,
-                    'pressure_curve': stroke_anim.pressure_curve,
-                    'velocity_curve': stroke_anim.velocity_curve,
-                    'brush_size_curve': stroke_anim.brush_size_curve,
-                    'ink_flow_curve': stroke_anim.ink_flow_curve,
-                    'duration': stroke_anim.duration,
-                    'metadata': stroke_anim.metadata
-                }
-                animation_data['stroke_animations'].append(stroke_data)
-            
-            # 保存到文件
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(animation_data, f, indent=2, ensure_ascii=False)
-            
-            self.logger.info(f"Animation saved to {output_path}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error saving animation: {str(e)}")
-            return False
+        )
     
-    def load_animation(self, input_path: str) -> Optional[PaintingAnimation]:
+    def create_preview_animation(self, strokes: List[Stroke], 
+                               max_duration: float = 5.0) -> AnimationSequence:
         """
-        加载动画数据
+        创建预览动画（快速版本）
         
         Args:
-            input_path (str): 输入路径
+            strokes: 笔触列表
+            max_duration: 最大持续时间
             
         Returns:
-            Optional[PaintingAnimation]: 绘画动画
+            预览动画序列
         """
-        try:
-            with open(input_path, 'r', encoding='utf-8') as f:
-                animation_data = json.load(f)
+        # 创建预览配置
+        preview_config = AnimationConfig(
+            fps=15,  # 降低帧率
+            duration=min(max_duration, len(strokes) * 0.1),
+            resolution=(640, 480),  # 降低分辨率
+            style=self.animation_config.style,
+            speed=PaintingSpeed.FAST,
+            show_brush=False,
+            enable_effects=False,
+            smooth_transitions=False
+        )
+        
+        # 简化笔触（如果太多）
+        if len(strokes) > 50:
+            # 选择代表性笔触
+            step = len(strokes) // 50
+            preview_strokes = strokes[::step]
+        else:
+            preview_strokes = strokes
+        
+        return self.create_animation(preview_strokes, custom_config=preview_config)
+    
+    def _calculate_timeline(self, strokes: List[Stroke], 
+                           config: AnimationConfig) -> Dict[str, Any]:
+        """
+        计算动画时间线
+        
+        Args:
+            strokes: 笔触列表
+            config: 动画配置
             
-            # 重建笔画动画
-            stroke_animations = []
-            for stroke_data in animation_data['stroke_animations']:
-                # 重建动画帧（简化版本）
-                frames = []
-                trajectory = stroke_data['trajectory']
-                timing = stroke_data['timing']
-                pressure_curve = stroke_data['pressure_curve']
-                
-                for i, (pos, time_offset, pressure) in enumerate(zip(trajectory, timing, pressure_curve)):
-                    frame = AnimationFrame(
-                        frame_id=i,
-                        timestamp=time_offset,
-                        brush_position=tuple(pos),
-                        brush_pressure=pressure,
-                        brush_angle=0.0,
-                        brush_size=stroke_data['brush_size_curve'][i],
-                        ink_flow=stroke_data['ink_flow_curve'][i],
-                        stroke_progress=i / (len(trajectory) - 1) if len(trajectory) > 1 else 1.0,
-                        canvas_state=None,
-                        metadata={'stroke_id': stroke_data['stroke_id']}
-                    )
-                    frames.append(frame)
-                
-                stroke_anim = StrokeAnimation(
-                    stroke_id=stroke_data['stroke_id'],
-                    trajectory=stroke_data['trajectory'],
-                    timing=stroke_data['timing'],
-                    pressure_curve=stroke_data['pressure_curve'],
-                    velocity_curve=stroke_data['velocity_curve'],
-                    brush_size_curve=stroke_data['brush_size_curve'],
-                    ink_flow_curve=stroke_data['ink_flow_curve'],
-                    duration=stroke_data['duration'],
-                    frames=frames,
-                    metadata=stroke_data['metadata']
-                )
-                stroke_animations.append(stroke_anim)
+        Returns:
+            时间线信息
+        """
+        total_frames = int(config.duration * config.fps)
+        
+        # 计算每个笔触的时间分配
+        stroke_weights = []
+        for stroke in strokes:
+            # 基于笔触复杂度计算权重
+            if hasattr(stroke, 'points') and stroke.points is not None and len(stroke.points) > 0:
+                complexity = len(stroke.points)
+            else:
+                complexity = 1
+            if hasattr(stroke, 'length'):
+                complexity *= stroke.length
+            stroke_weights.append(complexity)
+        
+        total_weight = sum(stroke_weights)
+        
+        # 分配时间
+        timeline = {
+            'total_frames': total_frames,
+            'total_duration': config.duration,
+            'stroke_schedule': []
+        }
+        
+        current_frame = 0
+        for i, weight in enumerate(stroke_weights):
+            # 计算笔触持续时间
+            stroke_frames = max(1, int((weight / total_weight) * total_frames * 0.8))  # 80%用于绘制
             
-            # 重建完整动画
-            all_frames = self._combine_stroke_animations(stroke_animations)
+            # 添加间隔
+            pause_frames = max(1, int(total_frames * 0.2 / len(strokes)))  # 20%用于间隔
             
-            animation = PaintingAnimation(
-                animation_id=animation_data['animation_id'],
-                stroke_animations=stroke_animations,
-                total_duration=animation_data['total_duration'],
-                fps=animation_data['fps'],
-                canvas_size=tuple(animation_data['canvas_size']),
-                background_color=tuple(animation_data['background_color']),
-                all_frames=all_frames,
-                metadata=animation_data['metadata']
+            timeline['stroke_schedule'].append({
+                'stroke_index': i,
+                'start_frame': current_frame,
+                'duration_frames': stroke_frames,
+                'end_frame': current_frame + stroke_frames,
+                'pause_frames': pause_frames
+            })
+            
+            current_frame += stroke_frames + pause_frames
+        
+        return timeline
+    
+    def _initialize_canvas(self, config: AnimationConfig, 
+                          reference_image: np.ndarray = None) -> np.ndarray:
+        """
+        初始化画布
+        
+        Args:
+            config: 动画配置
+            reference_image: 参考图像
+            
+        Returns:
+            初始画布
+        """
+        height, width = config.resolution[1], config.resolution[0]
+        
+        if reference_image is not None:
+            # 调整参考图像大小
+            import cv2
+            canvas = cv2.resize(reference_image, (width, height))
+            # 转换为背景色调
+            canvas = canvas * 0.1 + np.array(config.background_color) * 0.9
+            canvas = canvas.astype(np.uint8)
+        else:
+            # 创建纯色背景
+            canvas = np.full((height, width, 3), config.background_color, dtype=np.uint8)
+        
+        return canvas
+    
+    def _generate_frames(self, strokes: List[Stroke], timeline: Dict[str, Any], 
+                        initial_canvas: np.ndarray, config: AnimationConfig) -> List[AnimationFrame]:
+        """
+        生成动画帧
+        
+        Args:
+            strokes: 笔触列表
+            timeline: 时间线
+            initial_canvas: 初始画布
+            config: 动画配置
+            
+        Returns:
+            动画帧列表
+        """
+        frames = []
+        canvas = initial_canvas.copy()
+        
+        total_frames = timeline['total_frames']
+        
+        for frame_num in range(total_frames):
+            timestamp = frame_num / config.fps
+            
+            # 确定当前帧应该绘制的笔触
+            active_strokes = []
+            brush_position = None
+            brush_pressure = 0.0
+            
+            for stroke_info in timeline['stroke_schedule']:
+                if (stroke_info['start_frame'] <= frame_num <= 
+                    stroke_info['start_frame'] + stroke_info['duration_frames']):
+                    
+                    stroke_index = stroke_info['stroke_index']
+                    active_strokes.append(stroke_index)
+                    
+                    # 计算笔触内的进度
+                    stroke_progress = ((frame_num - stroke_info['start_frame']) / 
+                                     stroke_info['duration_frames'])
+                    
+                    # 绘制笔触的部分
+                    stroke = strokes[stroke_index]
+                    canvas = self._draw_stroke_partial(canvas, stroke, stroke_progress, config)
+                    
+                    # 更新笔刷位置
+                    # 检查笔触点数据和笔刷显示设置
+                    has_valid_points = (hasattr(stroke, 'points') and 
+                                       stroke.points is not None and 
+                                       len(stroke.points) > 0)
+                    # 确保config.show_brush是布尔值
+                    show_brush = bool(getattr(config, 'show_brush', False))
+                    if has_valid_points and show_brush:
+                        point_index = int(stroke_progress * (len(stroke.points) - 1))
+                        point_index = min(point_index, len(stroke.points) - 1)
+                        brush_position = stroke.points[point_index]
+                        brush_pressure = stroke_progress  # 简化的压力模拟
+            
+            # 创建动画帧
+            frame = AnimationFrame(
+                frame_number=frame_num,
+                timestamp=timestamp,
+                canvas_state=canvas.copy(),
+                active_strokes=active_strokes,
+                brush_position=brush_position,
+                brush_pressure=brush_pressure,
+                metadata={
+                    'progress': frame_num / total_frames,
+                    'active_stroke_count': len(active_strokes)
+                }
             )
             
-            self.logger.info(f"Animation loaded from {input_path}")
-            return animation
-            
-        except Exception as e:
-            self.logger.error(f"Error loading animation: {str(e)}")
-            return None
+            frames.append(frame)
+        
+        return frames
     
-    def _create_default_animation(self, strokes: List[Dict[str, Any]]) -> PaintingAnimation:
+    def _draw_stroke_partial(self, canvas: np.ndarray, stroke: Stroke, 
+                           progress: float, config: AnimationConfig) -> np.ndarray:
         """
-        创建默认动画
+        部分绘制笔触
         
         Args:
-            strokes (List[Dict]): 笔画列表
+            canvas: 画布
+            stroke: 笔触
+            progress: 绘制进度 (0-1)
+            config: 动画配置
             
         Returns:
-            PaintingAnimation: 默认动画
+            更新后的画布
         """
-        return PaintingAnimation(
-            animation_id="default_animation",
-            stroke_animations=[],
-            total_duration=1.0,
-            fps=self.fps,
-            canvas_size=self.canvas_size,
-            background_color=self.background_color,
-            all_frames=[],
-            metadata={'error': 'Failed to create animation'}
-        )
+        # 检查笔触是否有有效的点数据
+        if not hasattr(stroke, 'points') or stroke.points is None:
+            return canvas
+        if len(stroke.points) == 0 or progress <= 0:
+            return canvas
+        
+        # 计算要绘制的点数
+        total_points = len(stroke.points)
+        points_to_draw = int(progress * total_points)
+        points_to_draw = max(1, min(points_to_draw, total_points))
+        
+        # 获取要绘制的点
+        points = stroke.points[:points_to_draw]
+        
+        if len(points) < 2:
+            return canvas
+        
+        # 绘制线条
+        import cv2
+        
+        # 确定颜色
+        if hasattr(stroke, 'color') and stroke.color is not None:
+            color = stroke.color
+        else:
+            color = (0, 0, 0)  # 默认黑色
+        
+        # 确定线条粗细
+        if hasattr(stroke, 'thickness') and stroke.thickness is not None:
+            thickness = max(1, int(stroke.thickness))
+        else:
+            thickness = 2
+        
+        # 绘制路径
+        for i in range(len(points) - 1):
+            pt1 = (int(points[i][0]), int(points[i][1]))
+            pt2 = (int(points[i+1][0]), int(points[i+1][1]))
+            
+            # 根据动画风格调整绘制方式
+            if config.style == AnimationStyle.WATERCOLOR:
+                # 水彩效果：半透明，边缘模糊
+                overlay = canvas.copy()
+                cv2.line(overlay, pt1, pt2, color, thickness + 2)
+                canvas = cv2.addWeighted(canvas, 0.7, overlay, 0.3, 0)
+            
+            elif config.style == AnimationStyle.CALLIGRAPHY:
+                # 书法效果：变化的线条粗细
+                dynamic_thickness = max(1, int(thickness * (0.5 + 0.5 * np.sin(i * 0.5))))
+                cv2.line(canvas, pt1, pt2, color, dynamic_thickness)
+            
+            else:
+                # 默认绘制
+                cv2.line(canvas, pt1, pt2, color, thickness)
+        
+        return canvas
     
-    def _create_default_stroke_animation(self, stroke_id: int, start_time: float) -> StrokeAnimation:
+    def _calculate_stroke_timings(self, strokes: List[Stroke], 
+                                 timing_info: Dict[str, Any] = None) -> List[Dict[str, float]]:
         """
-        创建默认笔画动画
+        计算笔触时间安排
         
         Args:
-            stroke_id (int): 笔画ID
-            start_time (float): 开始时间
+            strokes: 笔触列表
+            timing_info: 时间信息
             
         Returns:
-            StrokeAnimation: 默认笔画动画
+            每个笔触的时间信息
         """
-        return StrokeAnimation(
-            stroke_id=stroke_id,
-            trajectory=[(0, 0), (100, 0)],
-            timing=[0.0, 1.0],
-            pressure_curve=[0.5, 0.5],
-            velocity_curve=[1.0, 1.0],
-            brush_size_curve=[5.0, 5.0],
-            ink_flow_curve=[0.7, 0.7],
-            duration=1.0,
-            frames=[],
-            metadata={'error': 'Default stroke animation'}
-        )
+        timings = []
+        current_time = 0.0
+        
+        base_duration = timing_info.get('base_duration', 0.5) if timing_info else 0.5
+        pause_duration = timing_info.get('pause_duration', 0.1) if timing_info else 0.1
+        
+        for stroke in strokes:
+            # 基于笔触复杂度计算持续时间
+            complexity_factor = 1.0
+            # 检查笔触点数据
+            has_valid_points = (hasattr(stroke, 'points') and 
+                               stroke.points is not None and 
+                               len(stroke.points) > 0)
+            if has_valid_points:
+                complexity_factor = min(3.0, len(stroke.points) / 10.0)
+            
+            duration = base_duration * complexity_factor
+            
+            timings.append({
+                'start_time': current_time,
+                'duration': duration,
+                'end_time': current_time + duration
+            })
+            
+            current_time += duration + pause_duration
+        
+        return timings
     
-    def get_animation_statistics(self, animation: PaintingAnimation) -> Dict[str, Any]:
+    def get_animation_info(self) -> Dict[str, Any]:
         """
-        获取动画统计信息
+        获取当前动画信息
+        
+        Returns:
+            动画信息
+        """
+        if self.current_sequence is None:
+            return {'status': 'no_animation'}
+        
+        return {
+            'status': 'ready',
+            'total_frames': len(self.current_sequence.frames),
+            'duration': self.current_sequence.total_duration,
+            'fps': self.current_sequence.fps,
+            'resolution': self.current_sequence.resolution,
+            'metadata': self.current_sequence.metadata
+        }
+    
+    def export_frames(self, output_dir: str, format: str = 'png') -> List[str]:
+        """
+        导出动画帧
         
         Args:
-            animation (PaintingAnimation): 绘画动画
+            output_dir: 输出目录
+            format: 图像格式
             
         Returns:
-            Dict[str, Any]: 统计信息
+            导出的文件路径列表
         """
-        try:
-            stats = {
-                'animation_id': animation.animation_id,
-                'total_duration': animation.total_duration,
-                'fps': animation.fps,
-                'total_frames': len(animation.all_frames),
-                'num_strokes': len(animation.stroke_animations),
-                'canvas_size': animation.canvas_size,
-                'stroke_statistics': []
+        if self.current_sequence is None:
+            return []
+        
+        import os
+        import cv2
+        
+        os.makedirs(output_dir, exist_ok=True)
+        exported_files = []
+        
+        for i, frame in enumerate(self.current_sequence.frames):
+            filename = f"frame_{i:06d}.{format}"
+            filepath = os.path.join(output_dir, filename)
+            
+            # 保存帧
+            cv2.imwrite(filepath, frame.canvas_state)
+            exported_files.append(filepath)
+        
+        self.logger.info(f"Exported {len(exported_files)} frames to {output_dir}")
+        return exported_files
+    
+    def clear_cache(self):
+        """清除缓存"""
+        self.frame_cache.clear()
+        self.stroke_cache.clear()
+        self.logger.info("Animation cache cleared")
+    
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """
+        获取性能统计
+        
+        Returns:
+            性能统计信息
+        """
+        return {
+            'frame_cache_size': len(self.frame_cache),
+            'stroke_cache_size': len(self.stroke_cache),
+            'current_sequence_frames': len(self.current_sequence.frames) if self.current_sequence else 0,
+            'animation_config': {
+                'fps': self.animation_config.fps,
+                'resolution': self.animation_config.resolution,
+                'style': self.animation_config.style.value,
+                'effects_enabled': self.animation_config.enable_effects
             }
-            
-            for stroke_anim in animation.stroke_animations:
-                stroke_stats = {
-                    'stroke_id': stroke_anim.stroke_id,
-                    'duration': stroke_anim.duration,
-                    'num_frames': len(stroke_anim.frames),
-                    'trajectory_length': len(stroke_anim.trajectory),
-                    'avg_pressure': np.mean(stroke_anim.pressure_curve),
-                    'avg_velocity': np.mean(stroke_anim.velocity_curve),
-                    'avg_brush_size': np.mean(stroke_anim.brush_size_curve),
-                    'avg_ink_flow': np.mean(stroke_anim.ink_flow_curve)
-                }
-                stats['stroke_statistics'].append(stroke_stats)
-            
-            return stats
-            
-        except Exception as e:
-            self.logger.error(f"Error getting animation statistics: {str(e)}")
-            return {'error': str(e)}
+        }

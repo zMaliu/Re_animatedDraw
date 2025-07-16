@@ -1,977 +1,865 @@
 # -*- coding: utf-8 -*-
 """
-基于规则的笔画排序
+基于规则的排序模块
 
-实现传统中国书法的笔画顺序规则
-包括：先横后竖、先撇后捺、从上到下、从左到右等
+提供基于绘画规则和启发式的笔触排序方法
 """
 
 import numpy as np
-import cv2
-from typing import Dict, List, Tuple, Optional, Any
+from typing import List, Dict, Any, Tuple, Optional, Callable
 from dataclasses import dataclass
 import logging
 from enum import Enum
-import math
-from collections import defaultdict
+from ..stroke_extraction.stroke_detector import Stroke
+from .spearman_correlation import SpearmanCorrelationCalculator
 
 
-class StrokeType(Enum):
-    """
-    笔画类型枚举
-    """
-    HORIZONTAL = "horizontal"      # 横
-    VERTICAL = "vertical"          # 竖
-    LEFT_FALLING = "left_falling"  # 撇
-    RIGHT_FALLING = "right_falling" # 捺
-    DOT = "dot"                   # 点
-    HOOK = "hook"                 # 钩
-    TURNING = "turning"           # 折
-    CURVE = "curve"               # 弯
-    COMPLEX = "complex"           # 复合笔画
-    UNKNOWN = "unknown"           # 未知类型
+class OrderingRule(Enum):
+    """排序规则类型"""
+    SPATIAL_PROXIMITY = "spatial_proximity"  # 空间邻近性
+    SIZE_BASED = "size_based"  # 基于大小
+    BRIGHTNESS_BASED = "brightness_based"  # 基于亮度
+    LAYER_BASED = "layer_based"  # 基于层次
+    DIRECTION_BASED = "direction_based"  # 基于方向
+    COMPLEXITY_BASED = "complexity_based"  # 基于复杂度
+    SEMANTIC_BASED = "semantic_based"  # 基于语义
+    ARTISTIC_CONVENTION = "artistic_convention"  # 艺术惯例
 
 
 @dataclass
-class OrderingRule:
-    """
-    排序规则数据结构
-    
-    Attributes:
-        rule_id (str): 规则ID
-        name (str): 规则名称
-        description (str): 规则描述
-        priority (int): 优先级（数字越小优先级越高）
-        condition (callable): 规则条件函数
-        action (callable): 规则动作函数
-        weight (float): 规则权重
-        enabled (bool): 是否启用
-    """
-    rule_id: str
-    name: str
-    description: str
-    priority: int
-    condition: callable
-    action: callable
-    weight: float = 1.0
+class RuleWeight:
+    """规则权重"""
+    rule: OrderingRule
+    weight: float
+    priority: int = 0
     enabled: bool = True
 
 
 @dataclass
-class RuleApplication:
-    """
-    规则应用结果
-    
-    Attributes:
-        rule_id (str): 规则ID
-        applied_strokes (List[int]): 应用的笔画索引
-        confidence (float): 应用置信度
-        effect (str): 应用效果描述
-    """
-    rule_id: str
-    applied_strokes: List[int]
-    confidence: float
-    effect: str
+class OrderingContext:
+    """排序上下文"""
+    image_size: Tuple[int, int]
+    drawing_style: str = "realistic"  # realistic, abstract, sketch, etc.
+    complexity_level: str = "medium"  # low, medium, high
+    target_audience: str = "general"  # beginner, intermediate, advanced, general
+    time_constraint: float = 1.0  # 时间约束因子
+    quality_preference: str = "balanced"  # speed, quality, balanced
+
+
+@dataclass
+class RuleBasedResult:
+    """基于规则的排序结果"""
+    ordered_strokes: List[Stroke]
+    ordering_indices: List[int]
+    rule_scores: Dict[OrderingRule, float]
+    total_score: float
+    applied_rules: List[OrderingRule]
+    metadata: Dict[str, Any]
 
 
 class RuleBasedOrdering:
-    """
-    基于规则的笔画排序器
+    """基于规则的排序器"""
     
-    实现传统中国书法笔画顺序规则
-    """
-    
-    def __init__(self, config):
+    def __init__(self, config: Dict[str, Any]):
         """
         初始化基于规则的排序器
         
         Args:
-            config: 配置对象
+            config: 配置参数
         """
         self.config = config
         self.logger = logging.getLogger(__name__)
         
-        # 规则配置
-        self.use_traditional_rules = config['stroke_ordering'].get('use_traditional_rules', True)
-        self.rule_strictness = config['stroke_ordering'].get('rule_strictness', 0.8)
-        self.spatial_tolerance = config['stroke_ordering'].get('spatial_tolerance', 20)
+        # 初始化规则权重
+        self.rule_weights = self._initialize_rule_weights()
         
-        # 初始化规则
-        self.rules = self._initialize_rules()
+        # 初始化Spearman相关系数计算器
+        self.spearman_calculator = SpearmanCorrelationCalculator(config)
         
-        # 笔画类型优先级
-        self.stroke_priority = {
-            StrokeType.HORIZONTAL: 1,
-            StrokeType.VERTICAL: 2,
-            StrokeType.LEFT_FALLING: 3,
-            StrokeType.RIGHT_FALLING: 4,
-            StrokeType.DOT: 5,
-            StrokeType.HOOK: 6,
-            StrokeType.TURNING: 7,
-            StrokeType.CURVE: 8,
-            StrokeType.COMPLEX: 9,
-            StrokeType.UNKNOWN: 10
+        # 规则函数映射
+        self.rule_functions = {
+            OrderingRule.SPATIAL_PROXIMITY: self._apply_spatial_proximity_rule,
+            OrderingRule.SIZE_BASED: self._apply_size_based_rule,
+            OrderingRule.BRIGHTNESS_BASED: self._apply_brightness_based_rule,
+            OrderingRule.LAYER_BASED: self._apply_layer_based_rule,
+            OrderingRule.DIRECTION_BASED: self._apply_direction_based_rule,
+            OrderingRule.COMPLEXITY_BASED: self._apply_complexity_based_rule,
+            OrderingRule.SEMANTIC_BASED: self._apply_semantic_based_rule,
+            OrderingRule.ARTISTIC_CONVENTION: self._apply_artistic_convention_rule
         }
     
-    def order_strokes(self, strokes: List[Dict[str, Any]]) -> Tuple[List[int], List[RuleApplication]]:
+    def order_strokes(self, strokes: List[Stroke], 
+                     context: OrderingContext = None,
+                     custom_rules: List[RuleWeight] = None) -> RuleBasedResult:
         """
-        基于规则排序笔画
+        基于规则对笔触进行排序
         
         Args:
-            strokes (List[Dict]): 笔画列表
+            strokes: 笔触列表
+            context: 排序上下文
+            custom_rules: 自定义规则权重
             
         Returns:
-            Tuple[List[int], List[RuleApplication]]: 排序结果和应用的规则
+            排序结果
         """
+        if not strokes:
+            return RuleBasedResult(
+                ordered_strokes=[],
+                ordering_indices=[],
+                rule_scores={},
+                total_score=0.0,
+                applied_rules=[],
+                metadata={}
+            )
+        
+        # 使用默认上下文
+        if context is None:
+            context = OrderingContext(
+                image_size=(800, 600),
+                drawing_style=self.config.get('drawing_style', 'realistic'),
+                complexity_level=self.config.get('complexity_level', 'medium')
+            )
+        
+        # 使用自定义规则或默认规则
+        rules = custom_rules or self._get_context_appropriate_rules(context)
+        
         try:
-            self.logger.info(f"Applying rule-based ordering to {len(strokes)} strokes")
+            # 计算每个规则的分数
+            rule_scores = {}
+            stroke_rankings = {}
             
-            # 初始化
-            self.strokes = strokes
-            applied_rules = []
-            
-            # 预处理：分类笔画
-            stroke_types = self._classify_strokes(strokes)
-            
-            # 初始顺序
-            current_order = list(range(len(strokes)))
-            
-            # 按优先级应用规则
-            sorted_rules = sorted(self.rules, key=lambda r: r.priority)
-            
-            for rule in sorted_rules:
-                if rule.enabled:
-                    order_before = current_order.copy()
+            for rule_weight in rules:
+                if not rule_weight.enabled:
+                    continue
+                
+                rule = rule_weight.rule
+                if rule in self.rule_functions:
+                    ranking = self.rule_functions[rule](strokes, context)
+                    rule_scores[rule] = self._evaluate_ranking_quality(ranking, strokes)
+                    stroke_rankings[rule] = ranking
                     
-                    # 应用规则
-                    rule_result = self._apply_rule(rule, current_order, stroke_types)
-                    
-                    if rule_result:
-                        current_order = rule_result['order']
-                        applied_rules.append(RuleApplication(
-                            rule_id=rule.rule_id,
-                            applied_strokes=rule_result.get('affected_strokes', []),
-                            confidence=rule_result.get('confidence', 0.5),
-                            effect=rule_result.get('effect', 'Order modified')
-                        ))
-                        
-                        self.logger.debug(f"Applied rule {rule.rule_id}: {rule.name}")
+                    self.logger.debug(f"Applied rule {rule.value}: score={rule_scores[rule]:.4f}")
             
-            self.logger.info(f"Rule-based ordering completed, applied {len(applied_rules)} rules")
+            # 组合规则结果
+            final_ranking = self._combine_rule_rankings(stroke_rankings, rules)
             
-            return current_order, applied_rules
+            # 计算总分
+            total_score = self._calculate_total_score(rule_scores, rules)
+            
+            # 生成最终排序
+            ordered_indices = final_ranking
+            ordered_strokes = [strokes[i] for i in ordered_indices]
+            
+            # 应用的规则
+            applied_rules = [rw.rule for rw in rules if rw.enabled and rw.rule in rule_scores]
+            
+            result = RuleBasedResult(
+                ordered_strokes=ordered_strokes,
+                ordering_indices=ordered_indices,
+                rule_scores=rule_scores,
+                total_score=total_score,
+                applied_rules=applied_rules,
+                metadata={
+                    'context': context,
+                    'num_strokes': len(strokes),
+                    'rules_applied': len(applied_rules),
+                    'stroke_rankings': stroke_rankings
+                }
+            )
+            
+            self.logger.info(f"Rule-based ordering completed: {len(strokes)} strokes, "
+                           f"{len(applied_rules)} rules, score={total_score:.4f}")
+            
+            return result
             
         except Exception as e:
-            self.logger.error(f"Error in rule-based ordering: {str(e)}")
-            return list(range(len(strokes))), []
+            self.logger.error(f"Error in rule-based ordering: {e}")
+            
+            # 返回原始顺序作为后备
+            return RuleBasedResult(
+                ordered_strokes=strokes,
+                ordering_indices=list(range(len(strokes))),
+                rule_scores={},
+                total_score=0.0,
+                applied_rules=[],
+                metadata={'error': str(e)}
+            )
     
-    def _initialize_rules(self) -> List[OrderingRule]:
+    def _initialize_rule_weights(self) -> List[RuleWeight]:
         """
-        初始化排序规则
+        初始化默认规则权重
         
         Returns:
-            List[OrderingRule]: 规则列表
+            规则权重列表
         """
-        rules = []
+        default_weights = {
+            OrderingRule.SPATIAL_PROXIMITY: 0.25,
+            OrderingRule.SIZE_BASED: 0.15,
+            OrderingRule.BRIGHTNESS_BASED: 0.10,
+            OrderingRule.LAYER_BASED: 0.20,
+            OrderingRule.DIRECTION_BASED: 0.10,
+            OrderingRule.COMPLEXITY_BASED: 0.10,
+            OrderingRule.SEMANTIC_BASED: 0.05,
+            OrderingRule.ARTISTIC_CONVENTION: 0.05
+        }
         
-        # 规则1：先横后竖
-        rules.append(OrderingRule(
-            rule_id="horizontal_before_vertical",
-            name="先横后竖",
-            description="横画应该在竖画之前",
-            priority=1,
-            condition=self._has_horizontal_and_vertical,
-            action=self._apply_horizontal_before_vertical,
-            weight=1.0
-        ))
+        # 从配置中获取权重
+        config_weights = self.config.get('rule_weights', {})
         
-        # 规则2：先撇后捺
-        rules.append(OrderingRule(
-            rule_id="left_falling_before_right_falling",
-            name="先撇后捺",
-            description="撇画应该在捺画之前",
-            priority=2,
-            condition=self._has_left_and_right_falling,
-            action=self._apply_left_before_right_falling,
-            weight=1.0
-        ))
+        rule_weights = []
+        for rule, default_weight in default_weights.items():
+            weight = config_weights.get(rule.value, default_weight)
+            enabled = config_weights.get(f'{rule.value}_enabled', True)
+            priority = config_weights.get(f'{rule.value}_priority', 0)
+            
+            rule_weights.append(RuleWeight(
+                rule=rule,
+                weight=weight,
+                priority=priority,
+                enabled=enabled
+            ))
         
-        # 规则3：从上到下
-        rules.append(OrderingRule(
-            rule_id="top_to_bottom",
-            name="从上到下",
-            description="上方的笔画应该在下方的笔画之前",
-            priority=3,
-            condition=self._has_vertical_separation,
-            action=self._apply_top_to_bottom,
-            weight=0.8
-        ))
+        # 按优先级排序
+        rule_weights.sort(key=lambda x: x.priority, reverse=True)
         
-        # 规则4：从左到右
-        rules.append(OrderingRule(
-            rule_id="left_to_right",
-            name="从左到右",
-            description="左侧的笔画应该在右侧的笔画之前",
-            priority=4,
-            condition=self._has_horizontal_separation,
-            action=self._apply_left_to_right,
-            weight=0.7
-        ))
+        return rule_weights
+    
+    def _get_context_appropriate_rules(self, context: OrderingContext) -> List[RuleWeight]:
+        """
+        根据上下文获取合适的规则
         
-        # 规则5：先中间后两边
-        rules.append(OrderingRule(
-            rule_id="center_first",
-            name="先中间后两边",
-            description="中间的笔画应该在两边的笔画之前",
-            priority=5,
-            condition=self._has_center_structure,
-            action=self._apply_center_first,
-            weight=0.6
-        ))
+        Args:
+            context: 排序上下文
+            
+        Returns:
+            适合的规则权重列表
+        """
+        rules = self.rule_weights.copy()
         
-        # 规则6：先外后内
-        rules.append(OrderingRule(
-            rule_id="outside_before_inside",
-            name="先外后内",
-            description="外围的笔画应该在内部的笔画之前",
-            priority=6,
-            condition=self._has_enclosure_structure,
-            action=self._apply_outside_before_inside,
-            weight=0.7
-        ))
+        # 根据绘画风格调整权重
+        if context.drawing_style == "sketch":
+            # 素描风格更注重空间和方向
+            self._adjust_rule_weight(rules, OrderingRule.SPATIAL_PROXIMITY, 1.2)
+            self._adjust_rule_weight(rules, OrderingRule.DIRECTION_BASED, 1.3)
+            self._adjust_rule_weight(rules, OrderingRule.COMPLEXITY_BASED, 0.8)
         
-        # 规则7：点画最后
-        rules.append(OrderingRule(
-            rule_id="dots_last",
-            name="点画最后",
-            description="点画通常在最后书写",
-            priority=7,
-            condition=self._has_dots,
-            action=self._apply_dots_last,
-            weight=0.8
-        ))
+        elif context.drawing_style == "abstract":
+            # 抽象风格更注重语义和艺术惯例
+            self._adjust_rule_weight(rules, OrderingRule.SEMANTIC_BASED, 1.5)
+            self._adjust_rule_weight(rules, OrderingRule.ARTISTIC_CONVENTION, 1.4)
+            self._adjust_rule_weight(rules, OrderingRule.SPATIAL_PROXIMITY, 0.8)
         
-        # 规则8：封口最后
-        rules.append(OrderingRule(
-            rule_id="closing_strokes_last",
-            name="封口最后",
-            description="封口的笔画应该最后书写",
-            priority=8,
-            condition=self._has_closing_strokes,
-            action=self._apply_closing_strokes_last,
-            weight=0.9
-        ))
+        elif context.drawing_style == "realistic":
+            # 写实风格更注重层次和亮度
+            self._adjust_rule_weight(rules, OrderingRule.LAYER_BASED, 1.3)
+            self._adjust_rule_weight(rules, OrderingRule.BRIGHTNESS_BASED, 1.2)
+        
+        # 根据复杂度调整权重
+        if context.complexity_level == "high":
+            self._adjust_rule_weight(rules, OrderingRule.COMPLEXITY_BASED, 1.4)
+            self._adjust_rule_weight(rules, OrderingRule.SEMANTIC_BASED, 1.2)
+        elif context.complexity_level == "low":
+            self._adjust_rule_weight(rules, OrderingRule.SPATIAL_PROXIMITY, 1.3)
+            self._adjust_rule_weight(rules, OrderingRule.SIZE_BASED, 1.2)
+        
+        # 根据质量偏好调整
+        if context.quality_preference == "speed":
+            # 速度优先，使用简单规则
+            self._adjust_rule_weight(rules, OrderingRule.SPATIAL_PROXIMITY, 1.5)
+            self._adjust_rule_weight(rules, OrderingRule.SIZE_BASED, 1.3)
+            self._disable_rule(rules, OrderingRule.SEMANTIC_BASED)
+            self._disable_rule(rules, OrderingRule.ARTISTIC_CONVENTION)
+        
+        elif context.quality_preference == "quality":
+            # 质量优先，使用所有规则
+            for rule_weight in rules:
+                rule_weight.enabled = True
         
         return rules
     
-    def _classify_strokes(self, strokes: List[Dict[str, Any]]) -> List[StrokeType]:
+    def _adjust_rule_weight(self, rules: List[RuleWeight], rule: OrderingRule, factor: float):
         """
-        分类笔画类型
+        调整规则权重
         
         Args:
-            strokes (List[Dict]): 笔画列表
-            
-        Returns:
-            List[StrokeType]: 笔画类型列表
+            rules: 规则列表
+            rule: 要调整的规则
+            factor: 调整因子
         """
-        try:
-            stroke_types = []
-            
-            for stroke in strokes:
-                # 从笔画数据中获取类型
-                stroke_class = stroke.get('stroke_class', 'unknown')
-                
-                # 映射到枚举类型
-                if stroke_class == 'horizontal':
-                    stroke_type = StrokeType.HORIZONTAL
-                elif stroke_class == 'vertical':
-                    stroke_type = StrokeType.VERTICAL
-                elif stroke_class == 'left_falling':
-                    stroke_type = StrokeType.LEFT_FALLING
-                elif stroke_class == 'right_falling':
-                    stroke_type = StrokeType.RIGHT_FALLING
-                elif stroke_class == 'dot':
-                    stroke_type = StrokeType.DOT
-                elif stroke_class == 'hook':
-                    stroke_type = StrokeType.HOOK
-                elif stroke_class == 'turning':
-                    stroke_type = StrokeType.TURNING
-                elif stroke_class == 'curve':
-                    stroke_type = StrokeType.CURVE
-                elif stroke_class == 'complex':
-                    stroke_type = StrokeType.COMPLEX
-                else:
-                    # 基于几何特征推断类型
-                    stroke_type = self._infer_stroke_type(stroke)
-                
-                stroke_types.append(stroke_type)
-            
-            return stroke_types
-            
-        except Exception as e:
-            self.logger.error(f"Error classifying strokes: {str(e)}")
-            return [StrokeType.UNKNOWN] * len(strokes)
+        for rule_weight in rules:
+            if rule_weight.rule == rule:
+                rule_weight.weight *= factor
+                break
     
-    def _infer_stroke_type(self, stroke: Dict[str, Any]) -> StrokeType:
+    def _disable_rule(self, rules: List[RuleWeight], rule: OrderingRule):
         """
-        基于几何特征推断笔画类型
+        禁用规则
         
         Args:
-            stroke (Dict): 笔画数据
-            
-        Returns:
-            StrokeType: 推断的笔画类型
+            rules: 规则列表
+            rule: 要禁用的规则
         """
-        try:
-            # 获取几何特征
-            bbox = stroke.get('bounding_rect', (0, 0, 1, 1))
-            width, height = bbox[2], bbox[3]
-            aspect_ratio = stroke.get('aspect_ratio', width / height if height > 0 else 1)
-            orientation = stroke.get('orientation', 0)
-            area = stroke.get('area', width * height)
-            
-            # 基于面积判断是否为点
-            if area < 100:  # 小面积认为是点
-                return StrokeType.DOT
-            
-            # 基于长宽比和方向判断类型
-            if aspect_ratio > 3:  # 很长的笔画
-                # 基于方向判断横竖
-                angle_deg = math.degrees(orientation) % 180
-                if angle_deg < 30 or angle_deg > 150:  # 接近水平
-                    return StrokeType.HORIZONTAL
-                elif 60 < angle_deg < 120:  # 接近垂直
-                    return StrokeType.VERTICAL
-                elif 30 <= angle_deg <= 60:  # 右上到左下
-                    return StrokeType.LEFT_FALLING
-                elif 120 <= angle_deg <= 150:  # 左上到右下
-                    return StrokeType.RIGHT_FALLING
-            
-            elif aspect_ratio < 0.3:  # 很高的笔画
-                return StrokeType.VERTICAL
-            
-            # 检查是否有钩或转折
-            skeleton = stroke.get('skeleton', [])
-            if len(skeleton) > 2:
-                # 计算转折角度
-                angles = self._calculate_skeleton_angles(skeleton)
-                if any(abs(angle) > 45 for angle in angles):
-                    return StrokeType.TURNING
-            
-            # 默认为复合笔画
-            return StrokeType.COMPLEX
-            
-        except Exception as e:
-            self.logger.error(f"Error inferring stroke type: {str(e)}")
-            return StrokeType.UNKNOWN
+        for rule_weight in rules:
+            if rule_weight.rule == rule:
+                rule_weight.enabled = False
+                break
     
-    def _calculate_skeleton_angles(self, skeleton: List[Tuple[int, int]]) -> List[float]:
+    def _apply_spatial_proximity_rule(self, strokes: List[Stroke], 
+                                     context: OrderingContext) -> List[int]:
         """
-        计算骨架的转折角度
+        应用空间邻近性规则
         
         Args:
-            skeleton (List[Tuple[int, int]]): 骨架点列表
+            strokes: 笔触列表
+            context: 排序上下文
             
         Returns:
-            List[float]: 转折角度列表
+            排序索引
         """
-        try:
-            if len(skeleton) < 3:
-                return []
-            
-            angles = []
-            for i in range(1, len(skeleton) - 1):
-                p1 = np.array(skeleton[i - 1])
-                p2 = np.array(skeleton[i])
-                p3 = np.array(skeleton[i + 1])
-                
-                # 计算向量
-                v1 = p2 - p1
-                v2 = p3 - p2
-                
-                # 计算角度
-                v1_norm = np.linalg.norm(v1)
-                v2_norm = np.linalg.norm(v2)
-                if v1_norm > 0 and v2_norm > 0:
-                    cos_angle = np.dot(v1, v2) / (v1_norm * v2_norm)
-                    cos_angle = np.clip(cos_angle, -1, 1)
-                    angle = math.degrees(math.acos(cos_angle))
-                    angles.append(180 - angle)  # 转折角度
-            
-            return angles
-            
-        except Exception as e:
-            self.logger.error(f"Error calculating skeleton angles: {str(e)}")
+        if not strokes:
             return []
+        
+        # 计算笔触中心点
+        centers = []
+        for stroke in strokes:
+            if hasattr(stroke, 'points') and stroke.points is not None and len(stroke.points) > 0:
+                center_x = float(np.mean([p[0] for p in stroke.points]))
+                center_y = float(np.mean([p[1] for p in stroke.points]))
+                centers.append((center_x, center_y))
+            else:
+                centers.append((0, 0))
+        
+        # 使用最近邻算法排序
+        visited = [False] * len(strokes)
+        ordering = []
+        
+        # 从左上角开始
+        current_idx = 0
+        min_distance = float('inf')
+        for i, (x, y) in enumerate(centers):
+            distance = x + y  # 曼哈顿距离到原点
+            if distance < min_distance:
+                min_distance = distance
+                current_idx = i
+        
+        while len(ordering) < len(strokes):
+            visited[current_idx] = True
+            ordering.append(current_idx)
+            
+            # 找到最近的未访问笔触
+            min_distance = float('inf')
+            next_idx = -1
+            
+            current_center = centers[current_idx]
+            
+            for i, center in enumerate(centers):
+                if not visited[i]:
+                    distance = float(np.sqrt((current_center[0] - center[0])**2 + 
+                                           (current_center[1] - center[1])**2))
+                    if distance < min_distance:
+                        min_distance = distance
+                        next_idx = i
+            
+            if next_idx != -1:
+                current_idx = next_idx
+            else:
+                # 找到任何未访问的笔触
+                for i in range(len(strokes)):
+                    if not visited[i]:
+                        current_idx = i
+                        break
+        
+        return ordering
     
-    def _apply_rule(self, rule: OrderingRule, current_order: List[int], 
-                   stroke_types: List[StrokeType]) -> Optional[Dict[str, Any]]:
+    def _apply_size_based_rule(self, strokes: List[Stroke], 
+                              context: OrderingContext) -> List[int]:
         """
-        应用单个规则
+        应用基于大小的规则
         
         Args:
-            rule (OrderingRule): 规则
-            current_order (List[int]): 当前顺序
-            stroke_types (List[StrokeType]): 笔画类型
+            strokes: 笔触列表
+            context: 排序上下文
             
         Returns:
-            Optional[Dict[str, Any]]: 应用结果
+            排序索引
         """
-        try:
-            # 检查规则条件
-            if rule.condition(current_order, stroke_types):
-                # 应用规则动作
-                result = rule.action(current_order, stroke_types)
-                if result:
-                    order_from_result = result.get('order')
-                    if isinstance(order_from_result, np.ndarray) and isinstance(current_order, np.ndarray):
-                        if not np.array_equal(order_from_result, current_order):
-                            return result
-                    elif isinstance(order_from_result, list) and isinstance(current_order, list):
-                        if order_from_result != current_order:
-                            return result
-                    else:
-                        # 如果类型不同或无法比较，假设不相等
-                        return result
-            
-            return None
-            
-        except Exception as e:
-            self.logger.error(f"Error applying rule {rule.rule_id}: {str(e)}")
-            return None
-    
-    # 规则条件函数
-    def _has_horizontal_and_vertical(self, order: List[int], types: List[StrokeType]) -> bool:
-        """
-        检查是否同时有横画和竖画
-        """
-        has_horizontal = StrokeType.HORIZONTAL in types
-        has_vertical = StrokeType.VERTICAL in types
-        return has_horizontal and has_vertical
-    
-    def _has_left_and_right_falling(self, order: List[int], types: List[StrokeType]) -> bool:
-        """
-        检查是否同时有撇和捺
-        """
-        has_left = StrokeType.LEFT_FALLING in types
-        has_right = StrokeType.RIGHT_FALLING in types
-        return has_left and has_right
-    
-    def _has_vertical_separation(self, order: List[int], types: List[StrokeType]) -> bool:
-        """
-        检查是否有垂直方向的分离
-        """
-        if len(order) < 2:
-            return False
-        
-        centroids = [self.strokes[i].get('centroid', (0, 0)) for i in order]
-        y_coords = [c[1] for c in centroids]
-        
-        return max(y_coords) - min(y_coords) > self.spatial_tolerance
-    
-    def _has_horizontal_separation(self, order: List[int], types: List[StrokeType]) -> bool:
-        """
-        检查是否有水平方向的分离
-        """
-        if len(order) < 2:
-            return False
-        
-        centroids = [self.strokes[i].get('centroid', (0, 0)) for i in order]
-        x_coords = [c[0] for c in centroids]
-        
-        return max(x_coords) - min(x_coords) > self.spatial_tolerance
-    
-    def _has_center_structure(self, order: List[int], types: List[StrokeType]) -> bool:
-        """
-        检查是否有中心结构
-        """
-        if len(order) < 3:
-            return False
-        
-        # 简单检查：是否有笔画在中心位置
-        centroids = [self.strokes[i].get('centroid', (0, 0)) for i in order]
-        x_coords = [c[0] for c in centroids]
-        
-        center_x = (min(x_coords) + max(x_coords)) / 2
-        center_tolerance = (max(x_coords) - min(x_coords)) * 0.2
-        
-        center_strokes = [i for i, c in enumerate(centroids) 
-                         if abs(c[0] - center_x) < center_tolerance]
-        
-        return len(center_strokes) > 0 and len(center_strokes) < len(centroids)
-    
-    def _has_enclosure_structure(self, order: List[int], types: List[StrokeType]) -> bool:
-        """
-        检查是否有包围结构
-        """
-        # 简化检查：是否有形成边界的笔画
-        if len(order) < 3:
-            return False
-        
-        # 检查是否有笔画形成矩形边界
-        bboxes = [self.strokes[i].get('bounding_rect', (0, 0, 1, 1)) for i in order]
-        
-        # 计算整体边界
-        min_x = min(bbox[0] for bbox in bboxes)
-        min_y = min(bbox[1] for bbox in bboxes)
-        max_x = max(bbox[0] + bbox[2] for bbox in bboxes)
-        max_y = max(bbox[1] + bbox[3] for bbox in bboxes)
-        
-        # 检查是否有笔画接近边界
-        boundary_tolerance = 10
-        boundary_strokes = 0
-        
-        for bbox in bboxes:
-            if (abs(bbox[0] - min_x) < boundary_tolerance or  # 左边界
-                abs(bbox[1] - min_y) < boundary_tolerance or  # 上边界
-                abs(bbox[0] + bbox[2] - max_x) < boundary_tolerance or  # 右边界
-                abs(bbox[1] + bbox[3] - max_y) < boundary_tolerance):  # 下边界
-                boundary_strokes += 1
-        
-        return boundary_strokes >= 2
-    
-    def _has_dots(self, order: List[int], types: List[StrokeType]) -> bool:
-        """
-        检查是否有点画
-        """
-        return StrokeType.DOT in types
-    
-    def _has_closing_strokes(self, order: List[int], types: List[StrokeType]) -> bool:
-        """
-        检查是否有封口笔画
-        """
-        # 简化检查：是否有可能的封口笔画
-        return len(order) > 2 and (StrokeType.HORIZONTAL in types or StrokeType.TURNING in types)
-    
-    # 规则动作函数
-    def _apply_horizontal_before_vertical(self, order: List[int], 
-                                        types: List[StrokeType]) -> Dict[str, Any]:
-        """
-        应用先横后竖规则
-        """
-        new_order = order.copy()
-        affected_strokes = []
-        
-        # 找到所有横画和竖画
-        horizontal_indices = [i for i, t in enumerate(types) if t == StrokeType.HORIZONTAL]
-        vertical_indices = [i for i, t in enumerate(types) if t == StrokeType.VERTICAL]
-        
-        # 检查是否需要调整
-        swapped = False
-        for h_idx in horizontal_indices:
-            for v_idx in vertical_indices:
-                h_pos = new_order.index(h_idx)
-                v_pos = new_order.index(v_idx)
-                
-                # 如果竖画在横画前面，且它们在空间上相近，则交换
-                if v_pos < h_pos:
-                    h_centroid = self.strokes[h_idx].get('centroid', (0, 0))
-                    v_centroid = self.strokes[v_idx].get('centroid', (0, 0))
-                    h_array = np.array(h_centroid)
-                    v_array = np.array(v_centroid)
-                    distance = np.linalg.norm(h_array - v_array)
-                    
-                    if distance < self.spatial_tolerance * 2:
-                        # 交换位置
-                        new_order[h_pos], new_order[v_pos] = new_order[v_pos], new_order[h_pos]
-                        affected_strokes.extend([h_idx, v_idx])
-                        swapped = True
-        
-        return {
-            'order': new_order,
-            'affected_strokes': affected_strokes,
-            'confidence': 0.9 if swapped else 0.5,
-            'effect': f'Moved {len(affected_strokes)} strokes to follow horizontal-before-vertical rule'
-        }
-    
-    def _apply_left_before_right_falling(self, order: List[int], 
-                                       types: List[StrokeType]) -> Dict[str, Any]:
-        """
-        应用先撇后捺规则
-        """
-        new_order = order.copy()
-        affected_strokes = []
-        
-        # 找到所有撇画和捺画
-        left_indices = [i for i, t in enumerate(types) if t == StrokeType.LEFT_FALLING]
-        right_indices = [i for i, t in enumerate(types) if t == StrokeType.RIGHT_FALLING]
-        
-        # 检查是否需要调整
-        swapped = False
-        for l_idx in left_indices:
-            for r_idx in right_indices:
-                l_pos = new_order.index(l_idx)
-                r_pos = new_order.index(r_idx)
-                
-                # 如果捺画在撇画前面，且它们在空间上相近，则交换
-                if r_pos < l_pos:
-                    l_centroid = self.strokes[l_idx].get('centroid', (0, 0))
-                    r_centroid = self.strokes[r_idx].get('centroid', (0, 0))
-                    l_array = np.array(l_centroid)
-                    r_array = np.array(r_centroid)
-                    distance = np.linalg.norm(l_array - r_array)
-                    
-                    if distance < self.spatial_tolerance * 2:
-                        # 交换位置
-                        new_order[l_pos], new_order[r_pos] = new_order[r_pos], new_order[l_pos]
-                        affected_strokes.extend([l_idx, r_idx])
-                        swapped = True
-        
-        return {
-            'order': new_order,
-            'affected_strokes': affected_strokes,
-            'confidence': 0.9 if swapped else 0.5,
-            'effect': f'Applied left-falling-before-right-falling rule to {len(affected_strokes)} strokes'
-        }
-    
-    def _apply_top_to_bottom(self, order: List[int], types: List[StrokeType]) -> Dict[str, Any]:
-        """
-        应用从上到下规则
-        """
-        # 按y坐标排序
-        stroke_positions = [(i, self.strokes[order[i]].get('centroid', (0, 0))[1]) 
-                           for i in range(len(order))]
-        stroke_positions.sort(key=lambda x: x[1])  # 按y坐标排序
-        
-        new_order = [order[pos[0]] for pos in stroke_positions]
-        
-        affected_strokes = []
-        for i in range(len(order)):
-            # 安全比较，避免数组真值歧义
-            try:
-                if not self._safe_compare(new_order[i], order[i]):
-                    affected_strokes.append(i)
-            except (ValueError, TypeError, IndexError):
-                # 如果比较失败，认为不相等
-                affected_strokes.append(i)
-        
-        return {
-            'order': new_order,
-            'affected_strokes': affected_strokes,
-            'confidence': 0.8,
-            'effect': f'Reordered {len(affected_strokes)} strokes from top to bottom'
-        }
-    
-    def _apply_left_to_right(self, order: List[int], types: List[StrokeType]) -> Dict[str, Any]:
-        """
-        应用从左到右规则
-        """
-        # 按x坐标排序（在相同y坐标范围内）
-        new_order = order.copy()
-        affected_strokes = []
-        
-        # 分组：y坐标相近的笔画
-        stroke_groups = self._group_strokes_by_y_position(order)
-        
-        for group in stroke_groups:
-            if len(group) > 1:
-                # 在组内按x坐标排序
-                group_positions = [(i, self.strokes[order[i]].get('centroid', (0, 0))[0]) 
-                                 for i in group]
-                group_positions.sort(key=lambda x: x[1])  # 按x坐标排序
-                
-                # 更新顺序
-                for j, (original_pos, _) in enumerate(group_positions):
-                    new_pos = group[j]
-                    # 安全比较，避免数组真值歧义
-                    try:
-                        old_val = new_order[new_pos]
-                        new_val = order[original_pos]
-                        
-                        # 使用安全比较函数
-                        if not self._safe_compare(old_val, new_val):
-                            affected_strokes.append(order[original_pos])
-                    except (ValueError, TypeError, IndexError):
-                        # 如果比较失败，认为不相等
-                        affected_strokes.append(order[original_pos])
-                    new_order[new_pos] = order[original_pos]
-        
-        return {
-            'order': new_order,
-            'affected_strokes': affected_strokes,
-            'confidence': 0.7,
-            'effect': f'Applied left-to-right rule to {len(affected_strokes)} strokes'
-        }
-    
-    def _apply_center_first(self, order: List[int], types: List[StrokeType]) -> Dict[str, Any]:
-        """
-        应用先中间后两边规则
-        """
-        centroids = [self.strokes[i].get('centroid', (0, 0)) for i in order]
-        x_coords = [c[0] for c in centroids]
-        
-        center_x = (min(x_coords) + max(x_coords)) / 2
-        
-        # 按距离中心的距离排序
-        stroke_distances = [(i, abs(centroids[i][0] - center_x)) for i in range(len(order))]
-        stroke_distances.sort(key=lambda x: x[1])  # 按距离中心的距离排序
-        
-        new_order = [order[pos[0]] for pos in stroke_distances]
-        affected_strokes = []
-        for i in range(len(order)):
-            # 安全比较，避免数组真值歧义
-            try:
-                if not self._safe_compare(new_order[i], order[i]):
-                    affected_strokes.append(i)
-            except (ValueError, TypeError, IndexError):
-                # 如果比较失败，认为不相等
-                affected_strokes.append(i)
-        
-        return {
-            'order': new_order,
-            'affected_strokes': affected_strokes,
-            'confidence': 0.6,
-            'effect': f'Applied center-first rule to {len(affected_strokes)} strokes'
-        }
-    
-    def _apply_outside_before_inside(self, order: List[int], 
-                                   types: List[StrokeType]) -> Dict[str, Any]:
-        """
-        应用先外后内规则
-        """
-        # 计算每个笔画到边界的距离
-        bboxes = [self.strokes[i].get('bounding_rect', (0, 0, 1, 1)) for i in order]
-        
-        # 计算整体边界
-        min_x = min(bbox[0] for bbox in bboxes)
-        min_y = min(bbox[1] for bbox in bboxes)
-        max_x = max(bbox[0] + bbox[2] for bbox in bboxes)
-        max_y = max(bbox[1] + bbox[3] for bbox in bboxes)
-        
-        # 计算每个笔画到边界的最小距离
-        stroke_boundary_distances = []
-        for i, bbox in enumerate(bboxes):
-            distances = [
-                bbox[0] - min_x,  # 到左边界
-                bbox[1] - min_y,  # 到上边界
-                max_x - (bbox[0] + bbox[2]),  # 到右边界
-                max_y - (bbox[1] + bbox[3])   # 到下边界
-            ]
-            min_distance = min(distances)
-            stroke_boundary_distances.append((i, min_distance))
-        
-        # 按到边界的距离排序（距离小的先画）
-        stroke_boundary_distances.sort(key=lambda x: x[1])
-        
-        new_order = [order[pos[0]] for pos in stroke_boundary_distances]
-        affected_strokes = []
-        for i in range(len(order)):
-            # 安全比较，避免数组真值歧义
-            try:
-                if not self._safe_compare(new_order[i], order[i]):
-                    affected_strokes.append(i)
-            except (ValueError, TypeError, IndexError):
-                # 如果比较失败，认为不相等
-                affected_strokes.append(i)
-        
-        return {
-            'order': new_order,
-            'affected_strokes': affected_strokes,
-            'confidence': 0.7,
-            'effect': f'Applied outside-before-inside rule to {len(affected_strokes)} strokes'
-        }
-    
-    def _apply_dots_last(self, order: List[int], types: List[StrokeType]) -> Dict[str, Any]:
-        """
-        应用点画最后规则
-        """
-        new_order = []
-        dots = []
-        affected_strokes = []
-        
-        # 分离点画和其他笔画
-        for i, stroke_type in enumerate(types):
-            if stroke_type == StrokeType.DOT:
-                dots.append(order[i])
-                affected_strokes.append(order[i])
+        # 计算笔触大小（边界框面积）
+        sizes = []
+        for stroke in strokes:
+            if hasattr(stroke, 'points') and stroke.points is not None and len(stroke.points) > 0:
+                xs = [p[0] for p in stroke.points]
+                ys = [p[1] for p in stroke.points]
+                width = max(xs) - min(xs)
+                height = max(ys) - min(ys)
+                size = width * height
             else:
-                new_order.append(order[i])
+                size = 0
+            sizes.append(size)
         
-        # 点画放在最后
-        new_order.extend(dots)
+        # 从大到小排序（大笔触先画）
+        size_indices = list(range(len(strokes)))
+        size_indices.sort(key=lambda i: sizes[i], reverse=True)
         
-        return {
-            'order': new_order,
-            'affected_strokes': affected_strokes,
-            'confidence': 0.8,
-            'effect': f'Moved {len(dots)} dots to the end'
-        }
+        return size_indices
     
-    def _apply_closing_strokes_last(self, order: List[int], 
-                                  types: List[StrokeType]) -> Dict[str, Any]:
+    def _apply_brightness_based_rule(self, strokes: List[Stroke], 
+                                   context: OrderingContext) -> List[int]:
         """
-        应用封口最后规则
-        """
-        # 简化实现：将可能的封口笔画（横画和转折）移到后面
-        new_order = []
-        closing_candidates = []
-        affected_strokes = []
-        
-        # 识别可能的封口笔画
-        for i, stroke_type in enumerate(types):
-            stroke = self.strokes[order[i]]
-            bbox = stroke.get('bounding_rect', (0, 0, 1, 1))
-            
-            # 简单判断：底部的横画可能是封口
-            if (stroke_type == StrokeType.HORIZONTAL and 
-                self._is_bottom_stroke(stroke, order)):
-                closing_candidates.append(order[i])
-                affected_strokes.append(order[i])
-            else:
-                new_order.append(order[i])
-        
-        # 封口笔画放在最后
-        new_order.extend(closing_candidates)
-        
-        return {
-            'order': new_order,
-            'affected_strokes': affected_strokes,
-            'confidence': 0.6,
-            'effect': f'Moved {len(closing_candidates)} potential closing strokes to the end'
-        }
-    
-    def _group_strokes_by_y_position(self, order: List[int]) -> List[List[int]]:
-        """
-        按y坐标位置分组笔画
+        应用基于亮度的规则
         
         Args:
-            order (List[int]): 笔画顺序
+            strokes: 笔触列表
+            context: 排序上下文
             
         Returns:
-            List[List[int]]: 分组结果
+            排序索引
         """
-        try:
-            # 获取所有y坐标
-            y_positions = [(i, self.strokes[order[i]].get('centroid', (0, 0))[1]) 
-                          for i in range(len(order))]
-            
-            # 按y坐标排序
-            y_positions.sort(key=lambda x: x[1])
-            
-            # 分组
-            groups = []
-            current_group = [y_positions[0][0]]
-            current_y = y_positions[0][1]
-            
-            for i in range(1, len(y_positions)):
-                pos, y = y_positions[i]
-                
-                if abs(y - current_y) <= self.spatial_tolerance:
-                    current_group.append(pos)
+        # 计算笔触平均亮度
+        brightnesses = []
+        for stroke in strokes:
+            if hasattr(stroke, 'color') and stroke.color is not None:
+                # 假设颜色是RGB格式
+                if isinstance(stroke.color, (list, tuple)) and len(stroke.color) >= 3:
+                    r, g, b = stroke.color[:3]
+                    brightness = 0.299 * r + 0.587 * g + 0.114 * b
                 else:
-                    groups.append(current_group)
-                    current_group = [pos]
-                    current_y = y
-            
-            groups.append(current_group)
-            
-            return groups
-            
-        except Exception as e:
-            self.logger.error(f"Error grouping strokes by y position: {str(e)}")
-            return [[i] for i in range(len(order))]
+                    brightness = 128  # 默认中等亮度
+            else:
+                brightness = 128  # 默认中等亮度
+            brightnesses.append(brightness)
+        
+        # 从暗到亮排序（暗色先画）
+        brightness_indices = list(range(len(strokes)))
+        brightness_indices.sort(key=lambda i: brightnesses[i])
+        
+        return brightness_indices
     
-    def _is_bottom_stroke(self, stroke: Dict[str, Any], order: List[int]) -> bool:
+    def _apply_layer_based_rule(self, strokes: List[Stroke], 
+                               context: OrderingContext) -> List[int]:
         """
-        判断是否为底部笔画
+        应用基于层次的规则
         
         Args:
-            stroke (Dict): 笔画数据
-            order (List[int]): 笔画顺序
+            strokes: 笔触列表
+            context: 排序上下文
             
         Returns:
-            bool: 是否为底部笔画
+            排序索引
         """
-        try:
-            stroke_y = stroke.get('centroid', (0, 0))[1]
+        # 计算笔触的层次（基于位置和大小）
+        layers = []
+        for stroke in strokes:
+            if hasattr(stroke, 'points') and stroke.points is not None and len(stroke.points) > 0:
+                # 计算中心点
+                center_x = np.mean([p[0] for p in stroke.points])
+                center_y = np.mean([p[1] for p in stroke.points])
+                
+                # 计算大小
+                xs = [p[0] for p in stroke.points]
+                ys = [p[1] for p in stroke.points]
+                size = (max(xs) - min(xs)) * (max(ys) - min(ys))
+                
+                # 层次 = 大小权重 + 位置权重（背景元素通常更大且居中）
+                layer = size * 0.7 + (context.image_size[0] * context.image_size[1] - 
+                                     (center_x - context.image_size[0]/2)**2 - 
+                                     (center_y - context.image_size[1]/2)**2) * 0.3
+            else:
+                layer = 0
+            layers.append(layer)
+        
+        # 从背景到前景排序（大层次值先画）
+        layer_indices = list(range(len(strokes)))
+        layer_indices.sort(key=lambda i: layers[i], reverse=True)
+        
+        return layer_indices
+    
+    def _apply_direction_based_rule(self, strokes: List[Stroke], 
+                                   context: OrderingContext) -> List[int]:
+        """
+        应用基于方向的规则
+        
+        Args:
+            strokes: 笔触列表
+            context: 排序上下文
             
-            # 计算所有笔画的y坐标范围
-            all_y = [self.strokes[i].get('centroid', (0, 0))[1] for i in order]
-            max_y = max(all_y)
-            y_range = max_y - min(all_y)
+        Returns:
+            排序索引
+        """
+        # 计算笔触的主要方向
+        directions = []
+        for stroke in strokes:
+            if hasattr(stroke, 'points') and stroke.points is not None and len(stroke.points) >= 2:
+                # 计算主要方向向量
+                start_point = stroke.points[0]
+                end_point = stroke.points[-1]
+                
+                dx = end_point[0] - start_point[0]
+                dy = end_point[1] - start_point[1]
+                
+                # 计算角度（弧度）
+                angle = np.arctan2(dy, dx)
+                
+                # 转换为0-2π范围
+                if angle < 0:
+                    angle += 2 * np.pi
+                
+                directions.append(angle)
+            else:
+                directions.append(0)
+        
+        # 按方向排序（从水平到垂直）
+        direction_indices = list(range(len(strokes)))
+        direction_indices.sort(key=lambda i: directions[i])
+        
+        return direction_indices
+    
+    def _apply_complexity_based_rule(self, strokes: List[Stroke], 
+                                    context: OrderingContext) -> List[int]:
+        """
+        应用基于复杂度的规则
+        
+        Args:
+            strokes: 笔触列表
+            context: 排序上下文
             
-            # 如果笔画在底部20%范围内，认为是底部笔画
-            return stroke_y > max_y - y_range * 0.2
+        Returns:
+            排序索引
+        """
+        # 计算笔触复杂度
+        complexities = []
+        for stroke in strokes:
+            if hasattr(stroke, 'points') and stroke.points is not None and len(stroke.points) > 0:
+                # 复杂度 = 点数 + 曲率变化
+                point_count = len(stroke.points)
+                
+                # 计算曲率变化
+                curvature_changes = 0
+                if point_count >= 3:
+                    for i in range(1, point_count - 1):
+                        p1 = stroke.points[i-1]
+                        p2 = stroke.points[i]
+                        p3 = stroke.points[i+1]
+                        
+                        # 计算角度变化
+                        v1 = (p2[0] - p1[0], p2[1] - p1[1])
+                        v2 = (p3[0] - p2[0], p3[1] - p2[1])
+                        
+                        # 避免除零
+                        len1 = np.sqrt(v1[0]**2 + v1[1]**2)
+                        len2 = np.sqrt(v2[0]**2 + v2[1]**2)
+                        
+                        if len1 > 0 and len2 > 0:
+                            cos_angle = (v1[0]*v2[0] + v1[1]*v2[1]) / (len1 * len2)
+                            cos_angle = np.clip(cos_angle, -1, 1)
+                            angle_change = np.arccos(cos_angle)
+                            curvature_changes += angle_change
+                
+                complexity = point_count * 0.3 + curvature_changes * 0.7
+            else:
+                complexity = 0
             
-        except Exception as e:
-            self.logger.error(f"Error checking if bottom stroke: {str(e)}")
-            return False
+            complexities.append(complexity)
+        
+        # 从简单到复杂排序（简单笔触先画）
+        complexity_indices = list(range(len(strokes)))
+        complexity_indices.sort(key=lambda i: complexities[i])
+        
+        return complexity_indices
+    
+    def _apply_semantic_based_rule(self, strokes: List[Stroke], 
+                                  context: OrderingContext) -> List[int]:
+        """
+        应用基于语义的规则
+        
+        Args:
+            strokes: 笔触列表
+            context: 排序上下文
+            
+        Returns:
+            排序索引
+        """
+        # 简化的语义分析（基于位置和形状特征）
+        semantic_scores = []
+        
+        for stroke in strokes:
+            score = 0
+            
+            if hasattr(stroke, 'points') and stroke.points is not None and len(stroke.points) > 0:
+                # 计算位置特征
+                center_x = np.mean([p[0] for p in stroke.points])
+                center_y = np.mean([p[1] for p in stroke.points])
+                
+                # 背景元素（通常在中心或边缘）
+                center_distance = np.sqrt((center_x - context.image_size[0]/2)**2 + 
+                                        (center_y - context.image_size[1]/2)**2)
+                
+                # 计算形状特征
+                xs = [p[0] for p in stroke.points]
+                ys = [p[1] for p in stroke.points]
+                width = max(xs) - min(xs) if xs else 0
+                height = max(ys) - min(ys) if ys else 0
+                aspect_ratio = width / height if height > 0 else 1
+                
+                # 语义评分（背景元素先画）
+                if aspect_ratio > 2 or aspect_ratio < 0.5:  # 长条形状，可能是背景线条
+                    score += 10
+                
+                if center_distance < min(context.image_size) * 0.3:  # 中心区域
+                    score += 5
+                
+                if width * height > context.image_size[0] * context.image_size[1] * 0.1:  # 大面积
+                    score += 8
+            
+            semantic_scores.append(score)
+        
+        # 按语义重要性排序（重要元素先画）
+        semantic_indices = list(range(len(strokes)))
+        semantic_indices.sort(key=lambda i: semantic_scores[i], reverse=True)
+        
+        return semantic_indices
+    
+    def _apply_artistic_convention_rule(self, strokes: List[Stroke], 
+                                       context: OrderingContext) -> List[int]:
+        """
+        应用艺术惯例规则
+        
+        Args:
+            strokes: 笔触列表
+            context: 排序上下文
+            
+        Returns:
+            排序索引
+        """
+        # 艺术惯例：从左到右，从上到下，从粗到细
+        convention_scores = []
+        
+        for stroke in strokes:
+            score = 0
+            
+            if hasattr(stroke, 'points') and stroke.points is not None and len(stroke.points) > 0:
+                # 位置权重（左上优先）
+                center_x = np.mean([p[0] for p in stroke.points])
+                center_y = np.mean([p[1] for p in stroke.points])
+                
+                # 归一化位置
+                norm_x = center_x / context.image_size[0]
+                norm_y = center_y / context.image_size[1]
+                
+                # 左上角权重更高
+                position_score = (1 - norm_x) * 0.5 + (1 - norm_y) * 0.5
+                
+                # 笔触粗细（如果有的话）
+                thickness_score = 0
+                if hasattr(stroke, 'thickness') and stroke.thickness is not None:
+                    # 粗笔触先画
+                    thickness_score = stroke.thickness / 10.0  # 假设最大粗细为10
+                
+                score = position_score * 0.7 + thickness_score * 0.3
+            
+            convention_scores.append(score)
+        
+        # 按艺术惯例排序
+        convention_indices = list(range(len(strokes)))
+        convention_indices.sort(key=lambda i: convention_scores[i], reverse=True)
+        
+        return convention_indices
+    
+    def _combine_rule_rankings(self, stroke_rankings: Dict[OrderingRule, List[int]], 
+                              rules: List[RuleWeight]) -> List[int]:
+        """
+        组合多个规则的排序结果
+        
+        Args:
+            stroke_rankings: 各规则的排序结果
+            rules: 规则权重列表
+            
+        Returns:
+            组合后的排序
+        """
+        if not stroke_rankings:
+            return list(range(len(stroke_rankings.get(list(stroke_rankings.keys())[0], []))))
+        
+        # 获取笔触数量
+        num_strokes = len(next(iter(stroke_rankings.values())))
+        
+        # 计算加权排名分数
+        weighted_scores = np.zeros(num_strokes)
+        total_weight = 0
+        
+        for rule_weight in rules:
+            if not rule_weight.enabled or rule_weight.rule not in stroke_rankings:
+                continue
+            
+            ranking = stroke_rankings[rule_weight.rule]
+            weight = rule_weight.weight
+            
+            # 将排序转换为分数（排名越靠前分数越高）
+            for rank, stroke_idx in enumerate(ranking):
+                score = (num_strokes - rank) / num_strokes  # 归一化分数
+                weighted_scores[stroke_idx] += weight * score
+            
+            total_weight += weight
+        
+        # 归一化
+        if total_weight > 0:
+            weighted_scores /= total_weight
+        
+        # 按分数排序
+        final_ranking = list(range(num_strokes))
+        final_ranking.sort(key=lambda i: weighted_scores[i], reverse=True)
+        
+        return final_ranking
+    
+    def _evaluate_ranking_quality(self, ranking: List[int], strokes: List[Stroke]) -> float:
+        """
+        评估排序质量
+        
+        Args:
+            ranking: 排序结果
+            strokes: 笔触列表
+            
+        Returns:
+            质量分数
+        """
+        if not ranking or len(ranking) != len(strokes):
+            return 0.0
+        
+        # 计算空间连续性
+        spatial_continuity = self._calculate_spatial_continuity(ranking, strokes)
+        
+        # 计算排序的多样性（避免过于单调）
+        diversity = self._calculate_ranking_diversity(ranking)
+        
+        # 组合分数
+        quality_score = spatial_continuity * 0.7 + diversity * 0.3
+        
+        return quality_score
+    
+    def _calculate_spatial_continuity(self, ranking: List[int], strokes: List[Stroke]) -> float:
+        """
+        计算空间连续性
+        
+        Args:
+            ranking: 排序结果
+            strokes: 笔触列表
+            
+        Returns:
+            连续性分数
+        """
+        if len(ranking) < 2:
+            return 1.0
+        
+        total_distance = 0
+        max_possible_distance = 0
+        
+        for i in range(len(ranking) - 1):
+            stroke1 = strokes[ranking[i]]
+            stroke2 = strokes[ranking[i + 1]]
+            
+            # 计算笔触间距离
+            if (hasattr(stroke1, 'points') and stroke1.points is not None and len(stroke1.points) > 0 and
+                hasattr(stroke2, 'points') and stroke2.points is not None and len(stroke2.points) > 0):
+                center1 = (np.mean([p[0] for p in stroke1.points]), 
+                          np.mean([p[1] for p in stroke1.points]))
+                center2 = (np.mean([p[0] for p in stroke2.points]), 
+                          np.mean([p[1] for p in stroke2.points]))
+                
+                distance = np.sqrt((center1[0] - center2[0])**2 + (center1[1] - center2[1])**2)
+                total_distance += distance
+                
+                # 最大可能距离（对角线）
+                max_possible_distance += np.sqrt(800**2 + 600**2)  # 假设图像大小
+        
+        if max_possible_distance > 0:
+            # 连续性 = 1 - (实际距离 / 最大可能距离)
+            continuity = 1 - (total_distance / max_possible_distance)
+            return max(0, continuity)
+        
+        return 1.0
+    
+    def _calculate_ranking_diversity(self, ranking: List[int]) -> float:
+        """
+        计算排序多样性
+        
+        Args:
+            ranking: 排序结果
+            
+        Returns:
+            多样性分数
+        """
+        if len(ranking) < 2:
+            return 1.0
+        
+        # 计算排序的熵
+        # 这里简化为检查排序是否过于规律
+        differences = []
+        for i in range(len(ranking) - 1):
+            diff = abs(ranking[i+1] - ranking[i])
+            differences.append(diff)
+        
+        if not differences:
+            return 1.0
+        
+        # 计算差异的标准差（多样性指标）
+        mean_diff = np.mean(differences)
+        std_diff = np.std(differences)
+        
+        # 归一化多样性分数
+        diversity = min(1.0, std_diff / (mean_diff + 1e-6))
+        
+        return diversity
+    
+    def _calculate_total_score(self, rule_scores: Dict[OrderingRule, float], 
+                              rules: List[RuleWeight]) -> float:
+        """
+        计算总分
+        
+        Args:
+            rule_scores: 各规则分数
+            rules: 规则权重
+            
+        Returns:
+            总分
+        """
+        total_score = 0
+        total_weight = 0
+        
+        for rule_weight in rules:
+            if rule_weight.enabled and rule_weight.rule in rule_scores:
+                total_score += rule_weight.weight * rule_scores[rule_weight.rule]
+                total_weight += rule_weight.weight
+        
+        if total_weight > 0:
+            return total_score / total_weight
+        
+        return 0.0
+    
+    def update_rule_weights(self, new_weights: Dict[OrderingRule, float]):
+        """
+        更新规则权重
+        
+        Args:
+            new_weights: 新的权重字典
+        """
+        for rule_weight in self.rule_weights:
+            if rule_weight.rule in new_weights:
+                rule_weight.weight = new_weights[rule_weight.rule]
+        
+        self.logger.info(f"Updated rule weights: {new_weights}")
     
     def get_rule_statistics(self) -> Dict[str, Any]:
         """
         获取规则统计信息
         
         Returns:
-            Dict[str, Any]: 统计信息
+            统计信息
         """
-        return {
-            'total_rules': len(self.rules),
-            'enabled_rules': len([r for r in self.rules if r.enabled]),
-            'rule_priorities': {r.rule_id: r.priority for r in self.rules},
-            'rule_weights': {r.rule_id: r.weight for r in self.rules},
-            'stroke_type_priorities': {t.value: p for t, p in self.stroke_priority.items()}
+        stats = {
+            'total_rules': len(self.rule_weights),
+            'enabled_rules': sum(1 for rw in self.rule_weights if rw.enabled),
+            'rule_weights': {rw.rule.value: rw.weight for rw in self.rule_weights},
+            'rule_priorities': {rw.rule.value: rw.priority for rw in self.rule_weights},
+            'rule_status': {rw.rule.value: rw.enabled for rw in self.rule_weights}
         }
-    
-    def enable_rule(self, rule_id: str) -> bool:
-        """
-        启用规则
         
-        Args:
-            rule_id (str): 规则ID
-            
-        Returns:
-            bool: 是否成功
-        """
-        for rule in self.rules:
-            if rule.rule_id == rule_id:
-                rule.enabled = True
-                return True
-        return False
-    
-    def disable_rule(self, rule_id: str) -> bool:
-        """
-        禁用规则
-        
-        Args:
-            rule_id (str): 规则ID
-            
-        Returns:
-            bool: 是否成功
-        """
-        for rule in self.rules:
-            if rule.rule_id == rule_id:
-                rule.enabled = False
-                return True
-        return False
-    
-    def set_rule_weight(self, rule_id: str, weight: float) -> bool:
-        """
-        设置规则权重
-        
-        Args:
-            rule_id (str): 规则ID
-            weight (float): 权重值
-            
-        Returns:
-            bool: 是否成功
-        """
-        for rule in self.rules:
-            if rule.rule_id == rule_id:
-                rule.weight = weight
-                return True
-        return False
-    
-    def _safe_compare(self, a, b) -> bool:
-        """
-        安全比较两个值，避免数组真值歧义
-        
-        Args:
-            a: 第一个值
-            b: 第二个值
-            
-        Returns:
-            bool: 是否相等
-        """
-        # 使用通用的安全比较函数
-        from utils.math_utils import safe_compare
-        return safe_compare(a, b)
+        return stats

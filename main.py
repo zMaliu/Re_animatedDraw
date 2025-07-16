@@ -76,8 +76,11 @@ class ChinesePaintingAnimator:
             
             # 笔画检测配置
             'stroke_detection': {
-                'method': 'hybrid',
-                'edge_threshold': 50,
+                'method': 'region_growing',
+                'adaptive_block_size': 25,
+                'adaptive_c': 10,
+                'region_growing_threshold': 2.0,
+                'min_region_size': 100,
                 'min_stroke_length': 10,
                 'max_stroke_width': 50
             },
@@ -131,7 +134,8 @@ class ChinesePaintingAnimator:
         self.image_analyzer = ImageAnalyzer()
         
         # 笔画检测组件
-        self.stroke_detector = StrokeDetector(self.config)
+        stroke_detection_config = self.config.get('stroke_detection', {})
+        self.stroke_detector = StrokeDetector(stroke_detection_config)
         self.stroke_extractor = StrokeExtractor()
         self.stroke_segmenter = StrokeSegmenter()
         
@@ -149,7 +153,8 @@ class ChinesePaintingAnimator:
         self.rule_based_ordering = RuleBasedOrdering(self.config)
         
         # 动画生成组件
-        self.painting_animator = PaintingAnimator(self.config)
+        animation_config = self.config.get('animation', {})
+        self.painting_animator = PaintingAnimator(animation_config)
         self.brush_simulator = BrushSimulator(self.config)
         self.animation_renderer = AnimationRenderer(self.config)
         self.timeline_manager = TimelineManager(self.config)
@@ -209,9 +214,9 @@ class ChinesePaintingAnimator:
             with self.profiler.profile_context("animation_rendering"):
                 output_files = self._render_animation(animation, output_dir)
             
-            # 步骤7: 生成可视化和报告
+            # 步骤7: 生成绘画过程动画和可视化
             with self.profiler.profile_context("visualization"):
-                visualization_files = self._generate_visualizations(
+                visualization_files = self._generate_painting_animation(
                     image, strokes, classified_strokes, ordered_strokes, output_dir
                 )
             
@@ -257,6 +262,10 @@ class ChinesePaintingAnimator:
         # 加载图像
         image = self.image_processor.load_image(image_path)
         
+        # 检查图像是否成功加载
+        if image is None:
+            raise ValueError(f"Failed to load image: {image_path}")
+        
         # 图像增强
         enhanced_image = self.image_enhancer.adjust_contrast(image, factor=1.2)
         enhanced_image = self.image_enhancer.unsharp_masking(enhanced_image, sigma=1.0, strength=0.5)
@@ -297,8 +306,8 @@ class ChinesePaintingAnimator:
         # 笔画分割（如果需要）
         segmented_strokes = []
         for stroke in extracted_strokes:
-            segments = self.stroke_segmenter.segment_stroke(stroke)
-            segmented_strokes.extend(segments)
+            segmentation_result = self.stroke_segmenter.segment_stroke(stroke)
+            segmented_strokes.extend(segmentation_result.segments)
         
         return segmented_strokes
     
@@ -319,9 +328,11 @@ class ChinesePaintingAnimator:
             classification_result = self.stroke_classifier.classify_stroke(stroke)
             
             # 在数据库中查找相似笔画
+            # 获取所有模板（这里需要从数据库获取）
+            templates = self.stroke_database.get_all_templates() if hasattr(self.stroke_database, 'get_all_templates') else []
             matching_result = self.stroke_matcher.find_best_match(
                 stroke,
-                threshold=self.config['stroke_database']['similarity_threshold']
+                templates
             )
             
             # 合并分类和匹配结果
@@ -356,17 +367,17 @@ class ChinesePaintingAnimator:
         
         # 优化排序
         if self.config['stroke_ordering']['method'] in ['hybrid', 'optimization']:
-            optimization_result = self.ordering_optimizer.optimize_ordering(
-                organization_result.ordered_strokes,
-                max_iterations=self.config['stroke_ordering']['optimization_iterations']
+            optimization_result = self.ordering_optimizer.optimize_stroke_order(
+                organization_result.organized_strokes
             )
-            final_order = optimization_result.best_ordering
+            final_order = optimization_result.optimized_strokes
         else:
-            final_order = organization_result.ordered_strokes
+            final_order = organization_result.organized_strokes
         
         # 应用传统规则（如果启用）
         if self.config['stroke_ordering']['use_traditional_rules']:
-            final_order = self.rule_based_ordering.apply_traditional_rules(final_order)
+            rule_result = self.rule_based_ordering.order_strokes(final_order)
+            final_order = rule_result.ordered_strokes
         
         # 重新组织分类信息
         ordered_classified_strokes = []
@@ -391,37 +402,68 @@ class ChinesePaintingAnimator:
             bool: 是否相等
         """
         try:
-            from utils.math_utils import safe_compare, ensure_scalar
+            import numpy as np
             
             # 首先检查是否是同一个对象
             if id(stroke1) == id(stroke2):
                 return True
-                
-            # 检查基本属性
-            if not isinstance(stroke1, dict) or not isinstance(stroke2, dict):
+            
+            # 如果任一笔画为None，返回False
+            if stroke1 is None or stroke2 is None:
                 return False
             
-            # 比较关键字段
-            key_fields = ['id', 'centroid', 'bounding_rect', 'contour']
-            for field in key_fields:
-                val1 = stroke1.get(field)
-                val2 = stroke2.get(field)
-                
-                # 如果两个值都不存在，继续检查下一个字段
-                if val1 is None and val2 is None:
+            # 检查笔画的基本属性
+            if not hasattr(stroke1, 'id') or not hasattr(stroke2, 'id'):
+                return False
+            
+            # 比较ID（如果可用）
+            if stroke1.id == stroke2.id:
+                return True
+            
+            # 比较骨架数据
+            if hasattr(stroke1, 'skeleton') and hasattr(stroke2, 'skeleton'):
+                skeleton1 = stroke1.skeleton
+                skeleton2 = stroke2.skeleton
+                if skeleton1 is not None and skeleton2 is not None:
+                    if not np.array_equal(skeleton1, skeleton2):
+                        return False
+            
+            # 比较其他关键属性
+            for attr in ['bbox', 'area', 'length', 'orientation']:
+                if not hasattr(stroke1, attr) or not hasattr(stroke2, attr):
                     continue
-                    
-                # 如果只有一个值不存在，则笔画不相等
-                if val1 is None or val2 is None:
-                    return False
                 
-                # 使用safe_compare进行安全比较
-                if not safe_compare(val1, val2):
+                val1 = getattr(stroke1, attr)
+                val2 = getattr(stroke2, attr)
+                
+                # 跳过None值的比较
+                if val1 is None or val2 is None:
+                    continue
+                
+                # 处理numpy数组比较
+                if isinstance(val1, np.ndarray) and isinstance(val2, np.ndarray):
+                    if not np.array_equal(val1, val2):
+                        return False
+                # 处理numpy标量比较
+                elif isinstance(val1, np.generic) or isinstance(val2, np.generic):
+                    try:
+                        # 将numpy标量转换为Python标量进行比较
+                        if isinstance(val1, np.generic):
+                            val1 = val1.item()
+                        if isinstance(val2, np.generic):
+                            val2 = val2.item()
+                        if val1 != val2:
+                            return False
+                    except (ValueError, TypeError) as e:
+                        self.logger.warning(f"Error comparing numpy scalars: {e}")
+                        return False
+                # 处理普通值比较
+                elif val1 != val2:
                     return False
             
             return True
                 
-        except (ValueError, TypeError) as e:
+        except (ValueError, TypeError, AttributeError) as e:
             # 如果比较失败，记录日志并返回False
             self.logger.warning(f"Error comparing strokes: {e}")
             return False
@@ -440,18 +482,29 @@ class ChinesePaintingAnimator:
         # 提取笔画数据
         strokes = [s['stroke_data'] for s in ordered_strokes]
         
-        # 创建动画
-        animation = self.painting_animator.create_animation(
-            strokes,
+        # 创建动画配置
+        from core.animation.painting_animator import AnimationConfig
+        animation_config = AnimationConfig(
             duration=self.config['animation']['duration'],
             fps=self.config['animation']['fps']
         )
         
+        # 创建动画
+        animation = self.painting_animator.create_animation(
+            strokes,
+            reference_image=image_data.get('original'),
+            custom_config=animation_config
+        )
+        
         # 如果启用笔刷模拟
         if self.config['animation']['brush_simulation']:
-            # 为每个笔画添加笔刷效果
-            for stroke_animation in animation.stroke_animations:
-                self.brush_simulator.simulate_brush_stroke(stroke_animation)
+            # 为动画帧添加笔刷效果
+            for frame in animation.frames:
+                if hasattr(frame, 'canvas_state') and frame.canvas_state is not None:
+                    # 对画布状态应用笔刷效果
+                    frame.canvas_state = self.brush_simulator.simulate_stroke_sequence(
+                        strokes, frame.canvas_state
+                    )
         
         return animation
     
@@ -473,42 +526,145 @@ class ChinesePaintingAnimator:
             'resolution': self.config['animation']['resolution'],
             'fps': self.config['animation']['fps'],
             'background_color': self.config['animation']['background_color'],
-            'quality': self.config['rendering']['quality'],
-            'show_progress': self.config['rendering']['show_progress']
+            'quality': self.config['rendering']['quality']
         }
+        
+        from core.animation.animation_renderer import RenderConfig, RenderFormat
         
         # 渲染视频
         if self.config['rendering']['output_format'] in ['mp4', 'avi']:
             video_path = os.path.join(output_dir, f"animation.{self.config['rendering']['output_format']}")
-            self.animation_renderer.render_video(animation, video_path, **render_settings)
-            output_files['video'] = video_path
+            render_config = RenderConfig(
+                output_path=video_path,
+                format=RenderFormat(self.config['rendering']['output_format']),
+                fps=render_settings['fps'],
+                resolution=render_settings['resolution'],
+                background_color=render_settings['background_color']
+            )
+            result = self.animation_renderer.render_animation(animation, render_config)
+            if result.success:
+                output_files['video'] = video_path
         
         # 渲染GIF
         if self.config['rendering']['output_format'] == 'gif':
             gif_path = os.path.join(output_dir, "animation.gif")
-            self.animation_renderer.render_gif(animation, gif_path, **render_settings)
-            output_files['gif'] = gif_path
+            render_config = RenderConfig(
+                output_path=gif_path,
+                format=RenderFormat.GIF,
+                fps=render_settings['fps'],
+                resolution=render_settings['resolution'],
+                background_color=render_settings['background_color']
+            )
+            result = self.animation_renderer.render_animation(animation, render_config)
+            if result.success:
+                output_files['gif'] = gif_path
         
         # 渲染图像序列
         frames_dir = os.path.join(output_dir, "frames")
         self.file_manager.create_directory(frames_dir)
-        frame_paths = self.animation_renderer.render_image_sequence(
-            animation, frames_dir, **render_settings
+        frames_config = RenderConfig(
+            output_path=frames_dir,
+            format=RenderFormat.FRAMES,
+            fps=render_settings['fps'],
+            resolution=render_settings['resolution'],
+            background_color=render_settings['background_color']
         )
-        output_files['frames'] = frame_paths
-        
-        # 生成缩略图
-        thumbnail_path = os.path.join(output_dir, "thumbnail.png")
-        self.animation_renderer.generate_thumbnail(animation, thumbnail_path)
-        output_files['thumbnail'] = thumbnail_path
+        result = self.animation_renderer.render_animation(animation, frames_config)
+        if result.success:
+            output_files['frames'] = result.output_path
         
         return output_files
     
-    def _generate_visualizations(self, image_data: Dict, strokes: list, 
-                               classified_strokes: list, ordered_strokes: list, 
-                               output_dir: str) -> Dict[str, str]:
+    def _generate_painting_animation(self, image_data: Dict, strokes: list, 
+                                   classified_strokes: list, ordered_strokes: list, 
+                                   output_dir: str) -> Dict[str, str]:
         """
-        生成可视化图像
+        生成绘画过程动画
+        
+        Args:
+            image_data (Dict): 图像数据
+            strokes (list): 原始笔画
+            classified_strokes (list): 分类后的笔画
+            ordered_strokes (list): 排序后的笔画
+            output_dir (str): 输出目录
+            
+        Returns:
+            Dict[str, str]: 动画文件路径
+        """
+        animation_files = {}
+        
+        try:
+            # 生成绘画过程动画
+            animation_path = os.path.join(output_dir, "painting_process.mp4")
+            
+            # 创建动画配置
+            from core.animation.painting_animator import AnimationConfig, AnimationStyle, PaintingSpeed
+            animation_config = AnimationConfig(
+                duration=self.config['animation']['duration'],
+                fps=self.config['animation']['fps'],
+                resolution=tuple(self.config['animation']['resolution']),
+                background_color=tuple(self.config['animation']['background_color']),
+                style=AnimationStyle(self.config['animation'].get('style', 'realistic')),
+                speed=PaintingSpeed(self.config['animation'].get('speed', 1.0)),
+                show_brush=self.config['animation'].get('show_brush_position', True),
+                show_progress=self.config['animation'].get('show_progress_indicator', True),
+                enable_effects=self.config['animation'].get('enable_effects', True),
+                smooth_transitions=self.config['animation'].get('smooth_transitions', True)
+            )
+            
+            # 提取笔画数据
+            strokes = [s['stroke_data'] for s in ordered_strokes]
+            
+            # 生成动画序列
+            animation_sequence = self.painting_animator.create_animation(
+                strokes, 
+                image_data['original'],
+                animation_config
+            )
+            
+            # 渲染绘画步骤图片序列
+            from core.animation import RenderConfig, RenderFormat
+            frames_dir = os.path.join(output_dir, "painting_steps")
+            self.file_manager.create_directory(frames_dir)
+            
+            render_config = RenderConfig(
+                output_path=frames_dir,
+                format=RenderFormat.FRAMES,
+                fps=self.config['rendering']['fps'],
+                resolution=tuple(self.config['rendering']['resolution']),
+                background_color=tuple(self.config['rendering']['background_color'])
+            )
+            
+            render_result = self.animation_renderer.render_animation(animation_sequence, render_config)
+            
+            if render_result.success:
+                animation_files['painting_steps'] = frames_dir
+                self.logger.info(f"绘画步骤图片序列已生成: {frames_dir}")
+                
+                # 生成缩略图
+                if self.config['rendering']['generate_thumbnail']:
+                    thumbnail_path = os.path.join(output_dir, "thumbnail.png")
+                    # 从动画序列中提取最后一帧作为缩略图
+                    if animation_sequence.frames:
+                        last_frame = animation_sequence.frames[-1]
+                        self.image_processor.save_image(last_frame.canvas_state, thumbnail_path)
+                        animation_files['thumbnail'] = thumbnail_path
+            else:
+                self.logger.error(f"图片序列渲染失败: {render_result.error}")
+                
+        except Exception as e:
+            self.logger.error(f"生成绘画动画失败: {str(e)}")
+            # 如果动画生成失败，回退到静态可视化
+            if self.config['output']['create_visualizations']:
+                return self._generate_fallback_visualizations(image_data, strokes, classified_strokes, ordered_strokes, output_dir)
+        
+        return animation_files
+    
+    def _generate_fallback_visualizations(self, image_data: Dict, strokes: list, 
+                                        classified_strokes: list, ordered_strokes: list, 
+                                        output_dir: str) -> Dict[str, str]:
+        """
+        生成回退的静态可视化图像
         
         Args:
             image_data (Dict): 图像数据
@@ -522,26 +678,24 @@ class ChinesePaintingAnimator:
         """
         viz_files = {}
         
-        # 笔画检测结果可视化
-        detection_viz_path = os.path.join(output_dir, "stroke_detection.png")
-        self.visualizer.visualize_stroke_detection(
-            image_data['original'], strokes, detection_viz_path
-        )
-        viz_files['detection'] = detection_viz_path
-        
-        # 笔画分类结果可视化
-        classification_viz_path = os.path.join(output_dir, "stroke_classification.png")
-        self.visualizer.visualize_stroke_classification(
-            image_data['original'], classified_strokes, classification_viz_path
-        )
-        viz_files['classification'] = classification_viz_path
-        
-        # 笔画排序结果可视化
-        ordering_viz_path = os.path.join(output_dir, "stroke_ordering.png")
-        self.visualizer.visualize_stroke_ordering(
-            image_data['original'], ordered_strokes, ordering_viz_path
-        )
-        viz_files['ordering'] = ordering_viz_path
+        try:
+            # 笔画检测结果可视化
+            detection_viz_path = os.path.join(output_dir, "stroke_detection.png")
+            self.visualizer.plot_stroke_detection_result(
+                image_data['original'], strokes, detection_viz_path
+            )
+            viz_files['detection'] = detection_viz_path
+            
+            # 笔画排序结果可视化
+            ordering_viz_path = os.path.join(output_dir, "stroke_ordering.png")
+            ordering_indices = [i for i in range(len(ordered_strokes))]
+            self.visualizer.plot_stroke_ordering(
+                ordered_strokes, ordering_indices, ordering_viz_path
+            )
+            viz_files['ordering'] = ordering_viz_path
+            
+        except Exception as e:
+            self.logger.warning(f"静态可视化生成失败: {str(e)}")
         
         return viz_files
     
@@ -725,13 +879,11 @@ def main():
     
     parser.add_argument(
         "--input", "-i",
-        required=True,
         help="输入图像文件路径或包含图像的目录路径"
     )
     
     parser.add_argument(
         "--output", "-o",
-        required=True,
         help="输出动画的目录路径"
     )
     
@@ -757,35 +909,66 @@ def main():
         default="*.jpg,*.jpeg,*.png,*.bmp,*.tiff,*.tif",
         help="支持的图像格式 (默认: *.jpg,*.jpeg,*.png,*.bmp,*.tiff,*.tif)"
     )
+
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="启动GUI模式"
+    )
     
+    # 先解析参数以检查是否为GUI模式
     args = parser.parse_args()
+    
+    # 如果不是GUI模式，检查必需的参数
+    if not args.gui:
+        if not args.input:
+            parser.error("非GUI模式下必须指定 --input/-i 参数")
+        if not args.output:
+            parser.error("非GUI模式下必须指定 --output/-o 参数")
     
     # 设置日志级别
     log_level = 'DEBUG' if args.verbose else 'INFO'
     setup_logging(console_level=log_level, file_level='DEBUG')
     
     # 加载配置
-    config = None
     config_file = args.config or 'config.json'  # 默认使用config.json
+    config_manager = ConfigManager(config_file)
     
     try:
-        with open(config_file, 'r', encoding='utf-8') as f:
-            import json
-            config = json.load(f)
-        print(f"已加载配置文件: {config_file}")
-    except FileNotFoundError:
-        if args.config:  # 如果用户指定了配置文件但找不到
-            print(f"配置文件不存在: {config_file}")
-            return 1
-        else:  # 如果是默认配置文件不存在，给出提示但继续运行
-            print(f"默认配置文件 {config_file} 不存在，使用内置默认配置")
+        if not config_manager.load_config():
+            if args.config:  # 如果用户指定了配置文件但找不到
+                print(f"配置文件不存在或无效: {config_file}")
+                return 1
+            else:  # 如果是默认配置文件不存在，使用默认配置
+                print(f"默认配置文件 {config_file} 不存在，使用内置默认配置")
+                config = None
+        else:
+            config = config_manager.config_data
+            print(f"已加载配置文件: {config_file}")
+            
+            # 验证必要的配置项
+            required_sections = ['stroke_detection', 'stroke_database', 'stroke_ordering', 'animation']
+            for section in required_sections:
+                if section not in config:
+                    print(f"配置文件缺少必要的配置项: {section}")
+                    return 1
+            
+            # 验证笔画检测配置
+            stroke_detection = config.get('stroke_detection', {})
+            required_params = ['method', 'adaptive_block_size', 'adaptive_c', 'region_growing_threshold', 'min_region_size']
+            for param in required_params:
+                if param not in stroke_detection:
+                    print(f"笔画检测配置缺少必要参数: {param}")
+                    return 1
+    
     except Exception as e:
         print(f"加载配置文件失败: {e}")
         return 1
     
-    # 创建输出目录
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # 创建输出目录（仅在非GUI模式下）
+    if not args.gui:
+        output_dir = Path(args.output)
+        output_dir.mkdir(parents=True, exist_ok=True)
     
     # 初始化动画构建器
     print("初始化中国画动画构建器...")
@@ -796,7 +979,21 @@ def main():
         return 1
     
     # 处理输入
-    input_path = Path(args.input)
+    if args.gui:
+        try:
+            from ui.main_window import MainWindow
+            from PyQt5.QtWidgets import QApplication
+            app = QApplication(sys.argv)
+            window = MainWindow(animator)
+            window.show()
+            sys.exit(app.exec_())
+        except Exception as e:
+            print(f"启动GUI失败: {e}")
+            return 1
+
+    # 处理非GUI模式的输入路径
+    if not args.gui:
+        input_path = Path(args.input)
     
     if args.batch or input_path.is_dir():
         # 批处理模式

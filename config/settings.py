@@ -48,13 +48,14 @@ class Config:
         
         # 笔画检测参数
         self.stroke_detection = {
-            'canny_low_threshold': 50,   # Canny边缘检测低阈值
-            'canny_high_threshold': 150, # Canny边缘检测高阈值
+            'adaptive_block_size': 25,    # 自适应阈值分割块大小
+            'adaptive_c': 10,            # 自适应阈值常数
+            'region_growing_threshold': 2.0,  # 区域生长阈值
+            'min_region_size': 100,      # 最小区域大小
             'min_stroke_length': 20,     # 最小笔画长度
             'max_stroke_width': 50,      # 最大笔画宽度
             'skeleton_method': 'zhang_suen',  # 骨架提取方法
             'contour_approximation_epsilon': 0.02,  # 轮廓近似精度
-            'morphology_kernel_size': 3,  # 形态学操作核大小
         }
         
         # 笔画库参数

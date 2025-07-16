@@ -1,791 +1,664 @@
 # -*- coding: utf-8 -*-
 """
-笔画组织器
+笔触组织器模块
 
-实现论文中的三阶段笔画组织方法：
-1. 笔画分组 - 将相关笔画组织成组
-2. 组内排序 - 优化组内笔画顺序
-3. 组间排序 - 优化组间绘制顺序
+提供笔触的组织和管理功能，整合各种排序算法
 """
 
 import numpy as np
-import cv2
-from typing import Dict, List, Tuple, Optional, Any
+from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
 import logging
-from scipy.spatial.distance import cdist
-from scipy.cluster.hierarchy import linkage, fcluster
-from sklearn.cluster import DBSCAN, KMeans
-import networkx as nx
-from collections import defaultdict
-import math
-
-
-@dataclass
-class StrokeGroup:
-    """
-    笔画组数据结构
-    
-    Attributes:
-        group_id (int): 组ID
-        strokes (List[Dict]): 组内笔画列表
-        centroid (Tuple[float, float]): 组质心
-        bounding_box (Tuple[int, int, int, int]): 组边界框
-        group_type (str): 组类型（字符、部首、笔画簇等）
-        internal_order (List[int]): 组内笔画顺序
-        confidence (float): 分组置信度
-        metadata (Dict): 元数据
-    """
-    group_id: int
-    strokes: List[Dict[str, Any]]
-    centroid: Tuple[float, float]
-    bounding_box: Tuple[int, int, int, int]
-    group_type: str
-    internal_order: List[int]
-    confidence: float
-    metadata: Dict[str, Any]
+from ..stroke_extraction.stroke_detector import Stroke
+from .energy_function import EnergyFunction
+from .nes_optimizer import NESOptimizer
+from .constraint_handler import ConstraintHandler
+from .order_evaluator import OrderEvaluator
+from .spearman_correlation import SpearmanCorrelationCalculator
 
 
 @dataclass
 class OrganizationResult:
-    """
-    组织结果数据结构
-    
-    Attributes:
-        stroke_groups (List[StrokeGroup]): 笔画组列表
-        group_order (List[int]): 组间顺序
-        final_stroke_order (List[int]): 最终笔画顺序
-        organization_score (float): 组织质量分数
-        processing_time (float): 处理时间
-        metadata (Dict): 元数据
-    """
-    stroke_groups: List[StrokeGroup]
-    group_order: List[int]
-    final_stroke_order: List[int]
-    organization_score: float
-    processing_time: float
+    """组织结果数据结构"""
+    organized_strokes: List[Stroke]
+    organization_method: str
+    quality_score: float
+    execution_time: float
     metadata: Dict[str, Any]
+    stage_results: Dict[str, Any]
 
 
 class StrokeOrganizer:
-    """
-    笔画组织器
+    """笔触组织器"""
     
-    实现三阶段笔画组织算法
-    """
-    
-    def __init__(self, config):
+    def __init__(self, config: Dict[str, Any]):
         """
-        初始化笔画组织器
+        初始化笔触组织器
         
         Args:
-            config: 配置对象
+            config: 配置参数
         """
         self.config = config
         self.logger = logging.getLogger(__name__)
         
-        # 分组参数
-        self.grouping_method = config['stroke_ordering'].get('grouping_method', 'hierarchical')
-        self.max_groups = config['stroke_ordering'].get('max_groups', 20)
-        self.min_group_size = config['stroke_ordering'].get('min_group_size', 1)
-        self.distance_threshold = config['stroke_ordering'].get('distance_threshold', 50)
+        # 组织方法配置
+        self.organization_method = config.get('organization_method', 'hierarchical')
+        self.enable_optimization = config.get('enable_optimization', True)
+        self.use_constraints = config.get('use_constraints', True)
         
-        # 排序参数
-        self.ordering_method = config['stroke_ordering'].get('ordering_method', 'hybrid')
-        self.spatial_weight = config['stroke_ordering'].get('spatial_weight', 0.4)
-        self.semantic_weight = config['stroke_ordering'].get('semantic_weight', 0.3)
-        self.temporal_weight = config['stroke_ordering'].get('temporal_weight', 0.3)
+        # 初始化组件
+        self.energy_function = EnergyFunction(config)
+        self.nes_optimizer = NESOptimizer(config) if self.enable_optimization else None
+        self.constraint_handler = ConstraintHandler(config) if self.use_constraints else None
+        self.order_evaluator = OrderEvaluator(config)
+        self.spearman_calculator = SpearmanCorrelationCalculator(config)
         
-        # 优化参数
-        self.use_optimization = config['stroke_ordering'].get('use_optimization', True)
-        self.optimization_iterations = config['stroke_ordering'].get('optimization_iterations', 100)
-    
-    def organize_strokes(self, strokes: List[Dict[str, Any]]) -> OrganizationResult:
+        # 组织参数
+        self.max_group_size = config.get('max_group_size', 20)
+        self.min_group_size = config.get('min_group_size', 3)
+        self.similarity_threshold = config.get('similarity_threshold', 0.7)
+        
+    def organize_strokes(self, strokes: List[Stroke], 
+                        method: str = None) -> OrganizationResult:
         """
-        组织笔画顺序
+        组织笔触
         
         Args:
-            strokes (List[Dict]): 笔画列表
+            strokes: 笔触列表
+            method: 组织方法
             
         Returns:
-            OrganizationResult: 组织结果
+            组织结果
         """
+        if not strokes:
+            return OrganizationResult(
+                organized_strokes=[],
+                organization_method='none',
+                quality_score=0.0,
+                execution_time=0.0,
+                metadata={},
+                stage_results={}
+            )
+        
+        import time
+        start_time = time.time()
+        
+        method = method or self.organization_method
+        
         try:
-            import time
-            start_time = time.time()
+            if method == 'hierarchical':
+                result = self._hierarchical_organization(strokes)
+            elif method == 'spatial':
+                result = self._spatial_organization(strokes)
+            elif method == 'semantic':
+                result = self._semantic_organization(strokes)
+            elif method == 'hybrid':
+                result = self._hybrid_organization(strokes)
+            else:
+                raise ValueError(f"Unknown organization method: {method}")
             
-            self.logger.info(f"Organizing {len(strokes)} strokes")
+            execution_time = time.time() - start_time
             
-            # 阶段1：笔画分组
-            stroke_groups = self._group_strokes(strokes)
-            self.logger.info(f"Created {len(stroke_groups)} stroke groups")
+            # 评估组织质量
+            quality_score = self._evaluate_organization_quality(result['organized_strokes'])
             
-            # 阶段2：组内排序
-            for group in stroke_groups:
-                group.internal_order = self._order_strokes_within_group(group)
+            return OrganizationResult(
+                organized_strokes=result['organized_strokes'],
+                organization_method=method,
+                quality_score=quality_score,
+                execution_time=execution_time,
+                metadata=result.get('metadata', {}),
+                stage_results=result.get('stage_results', {})
+            )
             
-            # 阶段3：组间排序
-            group_order = self._order_groups(stroke_groups)
+        except Exception as e:
+            self.logger.error(f"Error organizing strokes: {e}")
+            execution_time = time.time() - start_time
             
-            # 生成最终笔画顺序
-            final_stroke_order = self._generate_final_order(stroke_groups, group_order)
+            return OrganizationResult(
+                organized_strokes=strokes,  # 返回原始顺序
+                organization_method=f'{method}_failed',
+                quality_score=0.0,
+                execution_time=execution_time,
+                metadata={'error': str(e)},
+                stage_results={}
+            )
+    
+    def group_strokes_by_similarity(self, strokes: List[Stroke]) -> List[List[Stroke]]:
+        """
+        按相似性分组笔触
+        
+        Args:
+            strokes: 笔触列表
             
-            # 计算组织质量分数
-            organization_score = self._evaluate_organization(stroke_groups, group_order, strokes)
+        Returns:
+            笔触分组列表
+        """
+        if not strokes:
+            return []
+        
+        groups = []
+        remaining_strokes = strokes.copy()
+        
+        while remaining_strokes:
+            # 选择第一个笔触作为种子
+            seed_stroke = remaining_strokes.pop(0)
+            current_group = [seed_stroke]
             
-            processing_time = time.time() - start_time
+            # 找到相似的笔触
+            i = 0
+            while i < len(remaining_strokes) and len(current_group) < self.max_group_size:
+                stroke = remaining_strokes[i]
+                
+                # 计算与组内笔触的平均相似度
+                similarities = []
+                for group_stroke in current_group:
+                    similarity = self._calculate_stroke_similarity(stroke, group_stroke)
+                    similarities.append(similarity)
+                
+                avg_similarity = np.mean(similarities)
+                
+                if avg_similarity >= self.similarity_threshold:
+                    current_group.append(remaining_strokes.pop(i))
+                else:
+                    i += 1
             
-            result = OrganizationResult(
-                stroke_groups=stroke_groups,
-                group_order=group_order,
-                final_stroke_order=final_stroke_order,
-                organization_score=organization_score,
-                processing_time=processing_time,
-                metadata={
-                    'grouping_method': self.grouping_method,
-                    'ordering_method': self.ordering_method,
-                    'num_groups': len(stroke_groups),
-                    'avg_group_size': np.mean([len(g.strokes) for g in stroke_groups])
+            groups.append(current_group)
+        
+        return groups
+    
+    def group_strokes_by_spatial_proximity(self, strokes: List[Stroke]) -> List[List[Stroke]]:
+        """
+        按空间邻近性分组笔触
+        
+        Args:
+            strokes: 笔触列表
+            
+        Returns:
+            笔触分组列表
+        """
+        if not strokes:
+            return []
+        
+        # 使用聚类算法进行空间分组
+        from sklearn.cluster import DBSCAN
+        
+        # 提取笔触中心点
+        centers = np.array([stroke.center for stroke in strokes])
+        
+        # 计算适当的eps参数
+        distances = []
+        for i in range(len(centers)):
+            for j in range(i + 1, len(centers)):
+                dist = np.linalg.norm(centers[i] - centers[j])
+                distances.append(dist)
+        
+        eps = np.percentile(distances, 20) if distances else 50.0
+        
+        # 执行DBSCAN聚类
+        clustering = DBSCAN(eps=eps, min_samples=self.min_group_size)
+        cluster_labels = clustering.fit_predict(centers)
+        
+        # 组织分组结果
+        groups = {}
+        for i, label in enumerate(cluster_labels):
+            if label not in groups:
+                groups[label] = []
+            groups[label].append(strokes[i])
+        
+        # 处理噪声点（label = -1）
+        result_groups = []
+        for label, group in groups.items():
+            if label == -1:
+                # 噪声点单独成组
+                for stroke in group:
+                    result_groups.append([stroke])
+            else:
+                result_groups.append(group)
+        
+        return result_groups
+    
+    def _hierarchical_organization(self, strokes: List[Stroke]) -> Dict[str, Any]:
+        """
+        分层组织方法
+        
+        Args:
+            strokes: 笔触列表
+            
+        Returns:
+            组织结果
+        """
+        stage_results = {}
+        
+        # 第一阶段：按类型分组
+        type_groups = self._group_by_stroke_type(strokes)
+        stage_results['type_grouping'] = {
+            'num_groups': len(type_groups),
+            'group_sizes': [len(group) for group in type_groups.values()]
+        }
+        
+        # 第二阶段：每个类型内部按空间分组
+        spatial_groups = []
+        for stroke_type, type_strokes in type_groups.items():
+            groups = self.group_strokes_by_spatial_proximity(type_strokes)
+            spatial_groups.extend(groups)
+        
+        stage_results['spatial_grouping'] = {
+            'num_groups': len(spatial_groups),
+            'group_sizes': [len(group) for group in spatial_groups]
+        }
+        
+        # 第三阶段：组内排序
+        organized_strokes = []
+        for group in spatial_groups:
+            if len(group) > 1:
+                ordered_group = self._order_group_strokes(group)
+            else:
+                ordered_group = group
+            organized_strokes.extend(ordered_group)
+        
+        stage_results['final_ordering'] = {
+            'total_strokes': len(organized_strokes)
+        }
+        
+        return {
+            'organized_strokes': organized_strokes,
+            'metadata': {
+                'method': 'hierarchical',
+                'num_stages': 3
+            },
+            'stage_results': stage_results
+        }
+    
+    def _spatial_organization(self, strokes: List[Stroke]) -> Dict[str, Any]:
+        """
+        空间组织方法
+        
+        Args:
+            strokes: 笔触列表
+            
+        Returns:
+            组织结果
+        """
+        # 按空间位置排序（从左到右，从上到下）
+        sorted_strokes = sorted(strokes, key=lambda s: (s.center[1], s.center[0]))
+        
+        return {
+            'organized_strokes': sorted_strokes,
+            'metadata': {
+                'method': 'spatial',
+                'sorting_key': 'position'
+            },
+            'stage_results': {
+                'spatial_sorting': {
+                    'total_strokes': len(sorted_strokes)
                 }
-            )
-            
-            self.logger.info(f"Organization completed in {processing_time:.2f}s, score: {organization_score:.3f}")
-            return result
-            
-        except Exception as e:
-            self.logger.error(f"Error organizing strokes: {str(e)}")
-            # 返回默认顺序
-            return self._create_default_organization(strokes)
-    
-    def _group_strokes(self, strokes: List[Dict[str, Any]]) -> List[StrokeGroup]:
-        """
-        第一阶段：笔画分组
-        
-        Args:
-            strokes (List[Dict]): 笔画列表
-            
-        Returns:
-            List[StrokeGroup]: 笔画组列表
-        """
-        try:
-            if self.grouping_method == 'hierarchical':
-                return self._hierarchical_grouping(strokes)
-            elif self.grouping_method == 'dbscan':
-                return self._dbscan_grouping(strokes)
-            elif self.grouping_method == 'kmeans':
-                return self._kmeans_grouping(strokes)
-            elif self.grouping_method == 'semantic':
-                return self._semantic_grouping(strokes)
-            else:
-                self.logger.warning(f"Unknown grouping method: {self.grouping_method}")
-                return self._hierarchical_grouping(strokes)
-                
-        except Exception as e:
-            self.logger.error(f"Error in stroke grouping: {str(e)}")
-            # 返回单个组
-            return [self._create_single_group(strokes)]
-    
-    def _hierarchical_grouping(self, strokes: List[Dict[str, Any]]) -> List[StrokeGroup]:
-        """
-        层次聚类分组
-        
-        Args:
-            strokes (List[Dict]): 笔画列表
-            
-        Returns:
-            List[StrokeGroup]: 笔画组列表
-        """
-        try:
-            if len(strokes) <= 1:
-                return [self._create_single_group(strokes)]
-            
-            # 提取笔画特征
-            features = self._extract_grouping_features(strokes)
-            
-            # 层次聚类
-            linkage_matrix = linkage(features, method='ward')
-            
-            # 确定聚类数量
-            num_clusters = min(self.max_groups, max(1, len(strokes) // 3))
-            cluster_labels = fcluster(linkage_matrix, num_clusters, criterion='maxclust')
-            
-            # 创建笔画组
-            groups = self._create_groups_from_labels(strokes, cluster_labels)
-            
-            return groups
-            
-        except Exception as e:
-            self.logger.error(f"Error in hierarchical grouping: {str(e)}")
-            return [self._create_single_group(strokes)]
-    
-    def _dbscan_grouping(self, strokes: List[Dict[str, Any]]) -> List[StrokeGroup]:
-        """
-        DBSCAN聚类分组
-        
-        Args:
-            strokes (List[Dict]): 笔画列表
-            
-        Returns:
-            List[StrokeGroup]: 笔画组列表
-        """
-        try:
-            if len(strokes) <= 1:
-                return [self._create_single_group(strokes)]
-            
-            # 提取空间特征（质心坐标）
-            centroids = np.array([stroke.get('centroid', (0, 0)) for stroke in strokes])
-            
-            # DBSCAN聚类
-            dbscan = DBSCAN(eps=self.distance_threshold, min_samples=self.min_group_size)
-            cluster_labels = dbscan.fit_predict(centroids)
-            
-            # 处理噪声点（标签为-1）
-            unique_labels = set(cluster_labels)
-            if -1 in unique_labels:
-                unique_labels.remove(-1)
-            
-            # 创建笔画组
-            groups = []
-            for label in unique_labels:
-                group_strokes = [strokes[i] for i, l in enumerate(cluster_labels) if l == label]
-                if len(group_strokes) >= self.min_group_size:
-                    group = self._create_stroke_group(group_strokes, len(groups), 'spatial_cluster')
-                    groups.append(group)
-            
-            # 处理噪声点
-            noise_strokes = [strokes[i] for i, l in enumerate(cluster_labels) if l == -1]
-            if noise_strokes:
-                noise_group = self._create_stroke_group(noise_strokes, len(groups), 'noise')
-                groups.append(noise_group)
-            
-            return groups if groups else [self._create_single_group(strokes)]
-            
-        except Exception as e:
-            self.logger.error(f"Error in DBSCAN grouping: {str(e)}")
-            return [self._create_single_group(strokes)]
-    
-    def _kmeans_grouping(self, strokes: List[Dict[str, Any]]) -> List[StrokeGroup]:
-        """
-        K-means聚类分组
-        
-        Args:
-            strokes (List[Dict]): 笔画列表
-            
-        Returns:
-            List[StrokeGroup]: 笔画组列表
-        """
-        try:
-            if len(strokes) <= 1:
-                return [self._create_single_group(strokes)]
-            
-            # 提取特征
-            features = self._extract_grouping_features(strokes)
-            
-            # 确定聚类数量
-            num_clusters = min(self.max_groups, max(1, len(strokes) // 2))
-            
-            # K-means聚类
-            kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
-            cluster_labels = kmeans.fit_predict(features)
-            
-            # 创建笔画组
-            groups = self._create_groups_from_labels(strokes, cluster_labels)
-            
-            return groups
-            
-        except Exception as e:
-            self.logger.error(f"Error in K-means grouping: {str(e)}")
-            return [self._create_single_group(strokes)]
-    
-    def _semantic_grouping(self, strokes: List[Dict[str, Any]]) -> List[StrokeGroup]:
-        """
-        基于语义的分组
-        
-        Args:
-            strokes (List[Dict]): 笔画列表
-            
-        Returns:
-            List[StrokeGroup]: 笔画组列表
-        """
-        try:
-            # 按笔画类型分组
-            type_groups = defaultdict(list)
-            
-            for i, stroke in enumerate(strokes):
-                stroke_type = stroke.get('stroke_class', 'unknown')
-                type_groups[stroke_type].append((i, stroke))
-            
-            # 创建笔画组
-            groups = []
-            for stroke_type, stroke_list in type_groups.items():
-                if len(stroke_list) >= self.min_group_size:
-                    group_strokes = [stroke for _, stroke in stroke_list]
-                    group = self._create_stroke_group(group_strokes, len(groups), f'semantic_{stroke_type}')
-                    groups.append(group)
-            
-            return groups if groups else [self._create_single_group(strokes)]
-            
-        except Exception as e:
-            self.logger.error(f"Error in semantic grouping: {str(e)}")
-            return [self._create_single_group(strokes)]
-    
-    def _order_strokes_within_group(self, group: StrokeGroup) -> List[int]:
-        """
-        第二阶段：组内笔画排序
-        
-        Args:
-            group (StrokeGroup): 笔画组
-            
-        Returns:
-            List[int]: 组内笔画顺序（索引）
-        """
-        try:
-            if len(group.strokes) <= 1:
-                return list(range(len(group.strokes)))
-            
-            if self.ordering_method == 'spatial':
-                return self._spatial_ordering(group.strokes)
-            elif self.ordering_method == 'rule_based':
-                return self._rule_based_ordering(group.strokes)
-            elif self.ordering_method == 'hybrid':
-                return self._hybrid_ordering(group.strokes)
-            else:
-                return self._spatial_ordering(group.strokes)
-                
-        except Exception as e:
-            self.logger.error(f"Error ordering strokes within group: {str(e)}")
-            return list(range(len(group.strokes)))
-    
-    def _spatial_ordering(self, strokes: List[Dict[str, Any]]) -> List[int]:
-        """
-        基于空间位置的排序
-        
-        Args:
-            strokes (List[Dict]): 笔画列表
-            
-        Returns:
-            List[int]: 排序索引
-        """
-        try:
-            # 提取质心坐标
-            centroids = np.array([stroke.get('centroid', (0, 0)) for stroke in strokes])
-            
-            # 计算从左上到右下的排序
-            # 使用加权坐标：y坐标权重更高（从上到下优先）
-            weighted_coords = centroids[:, 1] * 2 + centroids[:, 0]  # 2*y + x
-            
-            # 排序
-            order = np.argsort(weighted_coords)
-            
-            return order.tolist()
-            
-        except Exception as e:
-            self.logger.error(f"Error in spatial ordering: {str(e)}")
-            return list(range(len(strokes)))
-    
-    def _rule_based_ordering(self, strokes: List[Dict[str, Any]]) -> List[int]:
-        """
-        基于规则的排序
-        
-        Args:
-            strokes (List[Dict]): 笔画列表
-            
-        Returns:
-            List[int]: 排序索引
-        """
-        try:
-            # 中国书法笔画顺序规则
-            stroke_priority = {
-                'horizontal': 1,    # 横
-                'vertical': 2,      # 竖
-                'left_falling': 3,  # 撇
-                'right_falling': 4, # 捺
-                'dot': 5,          # 点
-                'hook': 6,         # 钩
-                'turning': 7,      # 折
-                'curve': 8,        # 弯
-                'complex': 9       # 复合
             }
-            
-            # 计算排序分数
-            scores = []
-            for i, stroke in enumerate(strokes):
-                stroke_class = stroke.get('stroke_class', 'complex')
-                priority = stroke_priority.get(stroke_class, 9)
-                
-                # 结合空间位置
-                centroid = stroke.get('centroid', (0, 0))
-                spatial_score = centroid[1] * 1000 + centroid[0]  # y优先
-                
-                # 综合分数
-                total_score = priority * 10000 + spatial_score
-                scores.append((total_score, i))
-            
-            # 排序
-            scores.sort()
-            order = [idx for _, idx in scores]
-            
-            return order
-            
-        except Exception as e:
-            self.logger.error(f"Error in rule-based ordering: {str(e)}")
-            return list(range(len(strokes)))
+        }
     
-    def _hybrid_ordering(self, strokes: List[Dict[str, Any]]) -> List[int]:
+    def _semantic_organization(self, strokes: List[Stroke]) -> Dict[str, Any]:
         """
-        混合排序方法
+        语义组织方法
         
         Args:
-            strokes (List[Dict]): 笔画列表
+            strokes: 笔触列表
             
         Returns:
-            List[int]: 排序索引
+            组织结果
         """
-        try:
-            # 获取不同方法的排序结果
-            spatial_order = self._spatial_ordering(strokes)
-            rule_order = self._rule_based_ordering(strokes)
-            
-            # 计算综合排序分数
-            final_scores = []
-            
-            for i in range(len(strokes)):
-                spatial_rank = spatial_order.index(i)
-                rule_rank = rule_order.index(i)
-                
-                # 加权综合
-                combined_score = (
-                    self.spatial_weight * spatial_rank +
-                    (1 - self.spatial_weight) * rule_rank
-                )
-                
-                final_scores.append((combined_score, i))
-            
-            # 排序
-            final_scores.sort()
-            order = [idx for _, idx in final_scores]
-            
-            return order
-            
-        except Exception as e:
-            self.logger.error(f"Error in hybrid ordering: {str(e)}")
-            return list(range(len(strokes)))
+        # 按语义重要性排序
+        # 这里使用面积和位置作为重要性指标
+        importance_scores = []
+        for stroke in strokes:
+            # 计算重要性分数（面积 + 中心性）
+            area_score = stroke.area / max([s.area for s in strokes])
+            center_score = 1.0 - (abs(stroke.center[0] - 0.5) + abs(stroke.center[1] - 0.5)) / 2.0
+            importance = 0.6 * area_score + 0.4 * center_score
+            importance_scores.append(importance)
+        
+        # 按重要性排序
+        stroke_importance_pairs = list(zip(strokes, importance_scores))
+        stroke_importance_pairs.sort(key=lambda x: x[1], reverse=True)
+        
+        organized_strokes = [pair[0] for pair in stroke_importance_pairs]
+        
+        return {
+            'organized_strokes': organized_strokes,
+            'metadata': {
+                'method': 'semantic',
+                'importance_weights': {'area': 0.6, 'centrality': 0.4}
+            },
+            'stage_results': {
+                'importance_calculation': {
+                    'max_importance': max(importance_scores),
+                    'min_importance': min(importance_scores),
+                    'avg_importance': np.mean(importance_scores)
+                }
+            }
+        }
     
-    def _order_groups(self, stroke_groups: List[StrokeGroup]) -> List[int]:
+    def _hybrid_organization(self, strokes: List[Stroke]) -> Dict[str, Any]:
         """
-        第三阶段：组间排序
+        混合组织方法
         
         Args:
-            stroke_groups (List[StrokeGroup]): 笔画组列表
+            strokes: 笔触列表
             
         Returns:
-            List[int]: 组顺序
+            组织结果
         """
-        try:
-            if len(stroke_groups) <= 1:
-                return list(range(len(stroke_groups)))
-            
-            # 提取组特征
-            group_features = []
-            for group in stroke_groups:
-                # 使用组质心作为主要特征
-                centroid = group.centroid
-                bbox = group.bounding_box
-                
-                features = [
-                    centroid[0],  # x坐标
-                    centroid[1],  # y坐标
-                    bbox[2] * bbox[3],  # 面积
-                    len(group.strokes),  # 笔画数量
-                ]
-                group_features.append(features)
-            
-            # 基于空间位置排序（从左上到右下）
-            centroids = np.array([group.centroid for group in stroke_groups])
-            weighted_coords = centroids[:, 1] * 2 + centroids[:, 0]  # 2*y + x
-            
-            order = np.argsort(weighted_coords)
-            
-            return order.tolist()
-            
-        except Exception as e:
-            self.logger.error(f"Error ordering groups: {str(e)}")
-            return list(range(len(stroke_groups)))
+        stage_results = {}
+        
+        # 第一阶段：语义分组
+        semantic_result = self._semantic_organization(strokes)
+        semantic_strokes = semantic_result['organized_strokes']
+        stage_results['semantic_stage'] = semantic_result['stage_results']
+        
+        # 第二阶段：空间优化
+        spatial_groups = self.group_strokes_by_spatial_proximity(semantic_strokes)
+        stage_results['spatial_grouping'] = {
+            'num_groups': len(spatial_groups),
+            'group_sizes': [len(group) for group in spatial_groups]
+        }
+        
+        # 第三阶段：能量优化（如果启用）
+        final_strokes = []
+        if self.enable_optimization and self.nes_optimizer:
+            for group in spatial_groups:
+                if len(group) > 3:  # 只对较大的组进行优化
+                    optimized_group = self._optimize_group_order(group)
+                    final_strokes.extend(optimized_group)
+                else:
+                    final_strokes.extend(group)
+        else:
+            for group in spatial_groups:
+                final_strokes.extend(group)
+        
+        stage_results['optimization_stage'] = {
+            'optimized_groups': len([g for g in spatial_groups if len(g) > 3]),
+            'total_strokes': len(final_strokes)
+        }
+        
+        return {
+            'organized_strokes': final_strokes,
+            'metadata': {
+                'method': 'hybrid',
+                'stages': ['semantic', 'spatial', 'optimization']
+            },
+            'stage_results': stage_results
+        }
     
-    def _generate_final_order(self, stroke_groups: List[StrokeGroup], 
-                            group_order: List[int]) -> List[int]:
+    def _group_by_stroke_type(self, strokes: List[Stroke]) -> Dict[str, List[Stroke]]:
         """
-        生成最终笔画顺序
+        按笔触类型分组
         
         Args:
-            stroke_groups (List[StrokeGroup]): 笔画组列表
-            group_order (List[int]): 组顺序
+            strokes: 笔触列表
             
         Returns:
-            List[int]: 最终笔画顺序
+            类型分组字典
         """
-        try:
-            final_order = []
+        groups = {}
+        
+        for stroke in strokes:
+            # 根据笔触特征确定类型
+            stroke_type = self._determine_stroke_type(stroke)
             
-            for group_idx in group_order:
-                group = stroke_groups[group_idx]
-                
-                # 获取组内笔画的原始索引
-                for stroke_idx in group.internal_order:
-                    if stroke_idx < len(group.strokes):
-                        stroke = group.strokes[stroke_idx]
-                        original_idx = stroke.get('original_index', len(final_order))
-                        final_order.append(original_idx)
-            
-            return final_order
-            
-        except Exception as e:
-            self.logger.error(f"Error generating final order: {str(e)}")
-            return list(range(sum(len(g.strokes) for g in stroke_groups)))
+            if stroke_type not in groups:
+                groups[stroke_type] = []
+            groups[stroke_type].append(stroke)
+        
+        return groups
     
-    def _extract_grouping_features(self, strokes: List[Dict[str, Any]]) -> np.ndarray:
+    def _determine_stroke_type(self, stroke: Stroke) -> str:
         """
-        提取用于分组的特征
+        确定笔触类型
         
         Args:
-            strokes (List[Dict]): 笔画列表
+            stroke: 笔触
             
         Returns:
-            np.ndarray: 特征矩阵
+            笔触类型
         """
-        try:
-            features = []
-            
-            for stroke in strokes:
-                # 空间特征
-                centroid = stroke.get('centroid', (0, 0))
-                bbox = stroke.get('bounding_rect', (0, 0, 1, 1))
-                
-                # 几何特征
-                area = stroke.get('area', 0)
-                aspect_ratio = stroke.get('aspect_ratio', 1)
-                orientation = stroke.get('orientation', 0)
-                
-                feature_vector = [
-                    centroid[0],
-                    centroid[1],
-                    bbox[2],  # width
-                    bbox[3],  # height
-                    area,
-                    aspect_ratio,
-                    np.cos(orientation),  # 方向的cos值
-                    np.sin(orientation),  # 方向的sin值
-                ]
-                
-                features.append(feature_vector)
-            
-            return np.array(features)
-            
-        except Exception as e:
-            self.logger.error(f"Error extracting grouping features: {str(e)}")
-            return np.zeros((len(strokes), 8))
+        # 简化的类型判断逻辑
+        aspect_ratio = stroke.length / max(stroke.width, 1e-6)
+        
+        if aspect_ratio > 5.0:
+            return 'line'  # 线条
+        elif stroke.area > 1000:
+            return 'fill'  # 填充
+        else:
+            return 'detail'  # 细节
     
-    def _create_groups_from_labels(self, strokes: List[Dict[str, Any]], 
-                                 labels: np.ndarray) -> List[StrokeGroup]:
+    def _order_group_strokes(self, group: List[Stroke]) -> List[Stroke]:
         """
-        从聚类标签创建笔画组
+        对组内笔触进行排序
         
         Args:
-            strokes (List[Dict]): 笔画列表
-            labels (np.ndarray): 聚类标签
+            group: 笔触组
             
         Returns:
-            List[StrokeGroup]: 笔画组列表
+            排序后的笔触列表
         """
-        try:
-            groups = []
-            unique_labels = set(labels)
-            
-            for label in unique_labels:
-                group_strokes = [strokes[i] for i, l in enumerate(labels) if l == label]
-                
-                if len(group_strokes) >= self.min_group_size:
-                    group = self._create_stroke_group(group_strokes, len(groups), 'cluster')
-                    groups.append(group)
-            
-            return groups
-            
-        except Exception as e:
-            self.logger.error(f"Error creating groups from labels: {str(e)}")
-            return [self._create_single_group(strokes)]
+        if len(group) <= 1:
+            return group
+        
+        # 使用能量函数进行排序
+        if self.enable_optimization and self.nes_optimizer:
+            return self._optimize_group_order(group)
+        else:
+            # 简单的空间排序
+            return sorted(group, key=lambda s: (s.center[1], s.center[0]))
     
-    def _create_stroke_group(self, strokes: List[Dict[str, Any]], 
-                           group_id: int, group_type: str) -> StrokeGroup:
+    def _optimize_group_order(self, group: List[Stroke]) -> List[Stroke]:
         """
-        创建笔画组
+        优化组内笔触顺序
         
         Args:
-            strokes (List[Dict]): 笔画列表
-            group_id (int): 组ID
-            group_type (str): 组类型
+            group: 笔触组
             
         Returns:
-            StrokeGroup: 笔画组
+            优化后的笔触列表
         """
         try:
-            # 添加原始索引
-            for i, stroke in enumerate(strokes):
-                if 'original_index' not in stroke:
-                    stroke['original_index'] = i
+            # 使用NES优化器优化顺序
+            initial_order = list(range(len(group)))
             
-            # 计算组质心
-            centroids = [stroke.get('centroid', (0, 0)) for stroke in strokes]
-            centroid = (np.mean([c[0] for c in centroids]), np.mean([c[1] for c in centroids]))
+            def objective_function(order):
+                ordered_strokes = [group[i] for i in order]
+                # 准备笔触特征用于能量计算
+                stroke_features = {}
+                for idx, stroke in enumerate(ordered_strokes):
+                    stroke_features[idx] = {
+                        'id': getattr(stroke, 'id', idx),
+                        'area': getattr(stroke, 'area', 0.0),
+                        'length': getattr(stroke, 'length', 0.0),
+                        'center': getattr(stroke, 'center', (0.0, 0.0)),
+                        'color': getattr(stroke, 'color', (0, 0, 0)),
+                        'width': getattr(stroke, 'width', 1.0)
+                    }
+                energy_components = self.energy_function.calculate_energy(order, stroke_features)
+                return -energy_components.total_energy
             
-            # 计算组边界框
-            bboxes = [stroke.get('bounding_rect', (0, 0, 1, 1)) for stroke in strokes]
-            min_x = min(bbox[0] for bbox in bboxes)
-            min_y = min(bbox[1] for bbox in bboxes)
-            max_x = max(bbox[0] + bbox[2] for bbox in bboxes)
-            max_y = max(bbox[1] + bbox[3] for bbox in bboxes)
-            bounding_box = (min_x, min_y, max_x - min_x, max_y - min_y)
+            # 准备笔触特征
+            stroke_features = []
+            for stroke in group:
+                features = {
+                    'id': getattr(stroke, 'id', 0),
+                    'area': getattr(stroke, 'area', 0.0),
+                    'length': getattr(stroke, 'length', 0.0),
+                    'center': getattr(stroke, 'center', (0.0, 0.0))
+                }
+                stroke_features.append(features)
             
-            # 初始顺序
-            internal_order = list(range(len(strokes)))
-            
-            return StrokeGroup(
-                group_id=group_id,
-                strokes=strokes,
-                centroid=centroid,
-                bounding_box=bounding_box,
-                group_type=group_type,
-                internal_order=internal_order,
-                confidence=0.8,  # 默认置信度
-                metadata={'creation_method': group_type}
+            result = self.nes_optimizer.optimize(
+                energy_function=objective_function,
+                stroke_features=stroke_features,
+                initial_order=initial_order
             )
             
+            if result.success and result.best_order is not None:
+                optimized_order = result.best_order
+                # 确保顺序有效
+                optimized_order = self._fix_order_sequence(optimized_order, len(group))
+                return [group[i] for i in optimized_order]
+            else:
+                return group
+                
         except Exception as e:
-            self.logger.error(f"Error creating stroke group: {str(e)}")
-            return StrokeGroup(
-                group_id=group_id,
-                strokes=strokes,
-                centroid=(0, 0),
-                bounding_box=(0, 0, 1, 1),
-                group_type='error',
-                internal_order=list(range(len(strokes))),
-                confidence=0.1,
-                metadata={}
-            )
+            self.logger.warning(f"Error optimizing group order: {e}")
+            return group
     
-    def _create_single_group(self, strokes: List[Dict[str, Any]]) -> StrokeGroup:
+    def _fix_order_sequence(self, order: List[int], length: int) -> List[int]:
         """
-        创建包含所有笔画的单个组
+        修复顺序序列，确保每个索引只出现一次
         
         Args:
-            strokes (List[Dict]): 笔画列表
+            order: 原始顺序
+            length: 序列长度
             
         Returns:
-            StrokeGroup: 单个笔画组
+            修复后的顺序
         """
-        return self._create_stroke_group(strokes, 0, 'single_group')
+        # 检查输入有效性
+        if order is None or length <= 0:
+            return list(range(length))
+        
+        # 确保所有值在有效范围内
+        try:
+            order = [max(0, min(length-1, int(x))) for x in order if x is not None]
+        except (ValueError, TypeError):
+            return list(range(length))
+        
+        # 处理重复值
+        used = set()
+        fixed_order = []
+        available = list(range(length))
+        
+        for val in order:
+            if val not in used:
+                fixed_order.append(val)
+                used.add(val)
+                available.remove(val)
+            else:
+                # 使用第一个可用的值
+                if available:
+                    replacement = available.pop(0)
+                    fixed_order.append(replacement)
+                    used.add(replacement)
+        
+        # 添加任何遗漏的值
+        fixed_order.extend(available)
+        
+        return fixed_order[:length]
     
-    def _evaluate_organization(self, stroke_groups: List[StrokeGroup], 
-                             group_order: List[int], 
-                             original_strokes: List[Dict[str, Any]]) -> float:
+    def _calculate_stroke_similarity(self, stroke1: Stroke, stroke2: Stroke) -> float:
+        """
+        计算两个笔触的相似度
+        
+        Args:
+            stroke1: 第一个笔触
+            stroke2: 第二个笔触
+            
+        Returns:
+            相似度分数 (0-1)
+        """
+        try:
+            # 几何相似度
+            area_sim = 1.0 - abs(stroke1.area - stroke2.area) / max(stroke1.area + stroke2.area, 1e-6)
+            length_sim = 1.0 - abs(stroke1.length - stroke2.length) / max(stroke1.length + stroke2.length, 1e-6)
+            width_sim = 1.0 - abs(stroke1.width - stroke2.width) / max(stroke1.width + stroke2.width, 1e-6)
+            
+            # 位置相似度
+            distance = np.linalg.norm(np.array(stroke1.center) - np.array(stroke2.center))
+            max_distance = np.sqrt(2)  # 假设归一化坐标
+            position_sim = 1.0 - distance / max_distance
+            
+            # 加权平均
+            similarity = 0.3 * area_sim + 0.2 * length_sim + 0.2 * width_sim + 0.3 * position_sim
+            
+            return max(0.0, min(1.0, similarity))
+            
+        except Exception as e:
+            self.logger.warning(f"Error calculating stroke similarity: {e}")
+            return 0.0
+    
+    def _evaluate_organization_quality(self, organized_strokes: List[Stroke]) -> float:
         """
         评估组织质量
         
         Args:
-            stroke_groups (List[StrokeGroup]): 笔画组列表
-            group_order (List[int]): 组顺序
-            original_strokes (List[Dict]): 原始笔画列表
+            organized_strokes: 组织后的笔触列表
             
         Returns:
-            float: 组织质量分数
+            质量分数 (0-1)
         """
         try:
-            scores = []
-            
-            # 1. 组内紧密度
-            for group in stroke_groups:
-                if len(group.strokes) > 1:
-                    centroids = np.array([s.get('centroid', (0, 0)) for s in group.strokes])
-                    distances = cdist(centroids, centroids)
-                    avg_distance = np.mean(distances[distances > 0])
-                    compactness = 1 / (1 + avg_distance / 100)  # 归一化
-                    scores.append(compactness)
-            
-            # 2. 组间分离度
-            if len(stroke_groups) > 1:
-                group_centroids = np.array([g.centroid for g in stroke_groups])
-                group_distances = cdist(group_centroids, group_centroids)
-                avg_separation = np.mean(group_distances[group_distances > 0])
-                separation = min(1.0, avg_separation / 200)  # 归一化
-                scores.append(separation)
-            
-            # 3. 顺序合理性（基于空间位置）
-            final_order = self._generate_final_order(stroke_groups, group_order)
-            if len(final_order) > 1:
-                order_score = self._evaluate_order_quality(final_order, original_strokes)
-                scores.append(order_score)
-            
-            return np.mean(scores) if scores else 0.5
-            
-        except Exception as e:
-            self.logger.error(f"Error evaluating organization: {str(e)}")
-            return 0.5
-    
-    def _evaluate_order_quality(self, order: List[int], strokes: List[Dict[str, Any]]) -> float:
-        """
-        评估顺序质量
-        
-        Args:
-            order (List[int]): 笔画顺序
-            strokes (List[Dict]): 笔画列表
-            
-        Returns:
-            float: 顺序质量分数
-        """
-        try:
-            if len(order) <= 1:
+            if len(organized_strokes) <= 1:
                 return 1.0
             
-            # 计算相邻笔画间的距离
-            distances = []
-            for i in range(len(order) - 1):
-                stroke1 = strokes[order[i]]
-                stroke2 = strokes[order[i + 1]]
-                
-                centroid1 = stroke1.get('centroid', (0, 0))
-                centroid2 = stroke2.get('centroid', (0, 0))
-                
-                centroid1_array = np.array(centroid1)
-                centroid2_array = np.array(centroid2)
-                distance = np.linalg.norm(centroid1_array - centroid2_array)
-                distances.append(distance)
+            # 准备笔触特征
+            stroke_features = {}
+            for i, stroke in enumerate(organized_strokes):
+                stroke_features[i] = {
+                    'id': getattr(stroke, 'id', i),
+                    'area': getattr(stroke, 'area', 0.0),
+                    'length': getattr(stroke, 'length', 0.0),
+                    'center': getattr(stroke, 'center', (0.0, 0.0)),
+                    'color': getattr(stroke, 'color', (0, 0, 0)),
+                    'width': getattr(stroke, 'width', 1.0)
+                }
             
-            # 距离越小，顺序质量越高
-            avg_distance = np.mean(distances)
-            quality = 1 / (1 + avg_distance / 100)  # 归一化
+            # 使用订单评估器评估质量
+            order = list(range(len(organized_strokes)))
+            evaluation_result = self.order_evaluator.evaluate_order(order, stroke_features)
             
-            return quality
+            return evaluation_result.overall_score
             
         except Exception as e:
-            self.logger.error(f"Error evaluating order quality: {str(e)}")
+            self.logger.warning(f"Error evaluating organization quality: {e}")
             return 0.5
     
-    def _create_default_organization(self, strokes: List[Dict[str, Any]]) -> OrganizationResult:
+    def get_organization_statistics(self, result: OrganizationResult) -> Dict[str, Any]:
         """
-        创建默认组织结果
+        获取组织统计信息
         
         Args:
-            strokes (List[Dict]): 笔画列表
+            result: 组织结果
             
         Returns:
-            OrganizationResult: 默认组织结果
+            统计信息
         """
-        single_group = self._create_single_group(strokes)
+        strokes = result.organized_strokes
         
-        return OrganizationResult(
-            stroke_groups=[single_group],
-            group_order=[0],
-            final_stroke_order=list(range(len(strokes))),
-            organization_score=0.5,
-            processing_time=0.0,
-            metadata={'method': 'default'}
-        )
+        if not strokes:
+            return {}
+        
+        # 基本统计
+        stats = {
+            'total_strokes': len(strokes),
+            'organization_method': result.organization_method,
+            'quality_score': result.quality_score,
+            'execution_time': result.execution_time,
+            'average_stroke_area': np.mean([s.area for s in strokes]),
+            'total_area': sum(s.area for s in strokes)
+        }
+        
+        # 空间分布统计
+        centers = np.array([s.center for s in strokes])
+        stats['spatial_distribution'] = {
+            'center_x_mean': np.mean(centers[:, 0]),
+            'center_y_mean': np.mean(centers[:, 1]),
+            'center_x_std': np.std(centers[:, 0]),
+            'center_y_std': np.std(centers[:, 1])
+        }
+        
+        # 类型分布统计
+        type_counts = {}
+        for stroke in strokes:
+            stroke_type = self._determine_stroke_type(stroke)
+            type_counts[stroke_type] = type_counts.get(stroke_type, 0) + 1
+        
+        stats['type_distribution'] = type_counts
+        
+        return stats

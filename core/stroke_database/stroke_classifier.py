@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-笔画分类器
+笔触分类模块
 
-对检测到的笔画进行分类，识别不同类型的笔画
-支持基于规则和机器学习的分类方法
+提供笔触的自动分类和类别管理功能
 """
 
 import numpy as np
-import cv2
-from typing import Dict, List, Tuple, Optional, Any
+from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
+from enum import Enum
 import logging
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
@@ -18,614 +17,719 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, accuracy_score
 import joblib
 from pathlib import Path
-import math
+from ..stroke_extraction.stroke_detector import Stroke
+from .stroke_database import StrokeTemplate
+
+
+class StrokeCategory(Enum):
+    """笔触分类枚举"""
+    OUTLINE = "outline"          # 轮廓线
+    FILL = "fill"                # 填充
+    DETAIL = "detail"            # 细节
+    SHADOW = "shadow"            # 阴影
+    HIGHLIGHT = "highlight"      # 高光
+    TEXTURE = "texture"          # 纹理
+    BACKGROUND = "background"    # 背景
+    FOREGROUND = "foreground"    # 前景
+    UNKNOWN = "unknown"          # 未知
 
 
 @dataclass
 class ClassificationResult:
-    """
-    分类结果数据结构
-    
-    Attributes:
-        predicted_class (str): 预测类别
-        confidence (float): 分类置信度
-        class_probabilities (Dict[str, float]): 各类别概率
-        features_used (List[str]): 使用的特征列表
-        classification_details (Dict): 分类详细信息
-    """
-    predicted_class: str
+    """分类结果数据结构"""
+    category: StrokeCategory
     confidence: float
-    class_probabilities: Dict[str, float]
+    probabilities: Dict[StrokeCategory, float]
     features_used: List[str]
     classification_details: Dict[str, Any]
 
 
 class StrokeClassifier:
-    """
-    笔画分类器
+    """笔触分类器"""
     
-    提供多种笔画分类方法，包括基于规则和机器学习的方法
-    """
-    
-    def __init__(self, config):
+    def __init__(self, config: Dict[str, Any]):
         """
-        初始化笔画分类器
+        初始化笔触分类器
         
         Args:
-            config: 配置对象
+            config: 配置参数
         """
         self.config = config
         self.logger = logging.getLogger(__name__)
         
-        # 分类器配置
-        self.classification_method = config['stroke_classification'].get('method', 'hybrid')
-        self.model_path = config['stroke_classification'].get('model_path', 'models/stroke_classifier.pkl')
-        self.scaler_path = config['stroke_classification'].get('scaler_path', 'models/feature_scaler.pkl')
+        # 分类器参数
+        self.classifier_type = config.get('classifier_type', 'random_forest')
+        self.model_path = config.get('model_path', './models/stroke_classifier.pkl')
+        self.scaler_path = config.get('scaler_path', './models/stroke_scaler.pkl')
         
-        # 笔画类别定义
-        self.stroke_classes = config['stroke_classification'].get('classes', [
-            'horizontal',  # 横
-            'vertical',    # 竖
-            'left_falling', # 撇
-            'right_falling', # 捺
-            'dot',         # 点
-            'hook',        # 钩
-            'turning',     # 折
-            'curve',       # 弯
-            'complex'      # 复合笔画
-        ])
+        # 特征选择
+        self.feature_names = [
+            'area', 'perimeter', 'length', 'width', 'aspect_ratio',
+            'solidity', 'extent', 'orientation', 'eccentricity',
+            'compactness', 'convexity', 'roughness', 'symmetry',
+            'position_x', 'position_y', 'relative_size', 'density'
+        ]
         
-        # 特征权重
-        self.feature_weights = config['stroke_classification'].get('feature_weights', {
-            'geometric': 0.4,
-            'directional': 0.3,
-            'curvature': 0.2,
-            'texture': 0.1
-        })
+        # 初始化模型
+        self.classifier = None
+        self.scaler = StandardScaler()
+        self.is_trained = False
         
-        # 分类阈值
-        self.confidence_threshold = config['stroke_classification'].get('confidence_threshold', 0.7)
+        # 尝试加载预训练模型
+        self._load_model()
         
-        # 机器学习模型
-        self.ml_model = None
-        self.feature_scaler = None
+        # 分类规则（基于规则的后备分类器）
+        self.rule_based_classifier = RuleBasedClassifier(config)
         
-        # 加载预训练模型
-        self._load_models()
-    
-    def classify_stroke(self, stroke_data: Dict[str, Any]) -> ClassificationResult:
+    def classify_stroke(self, stroke: Stroke) -> ClassificationResult:
         """
-        对笔画进行分类
+        分类单个笔触
         
         Args:
-            stroke_data (Dict): 笔画数据
+            stroke: 输入笔触
             
         Returns:
-            ClassificationResult: 分类结果
+            分类结果
         """
         try:
-            if self.classification_method == 'rule_based':
-                return self._classify_by_rules(stroke_data)
-            elif self.classification_method == 'ml_based':
-                return self._classify_by_ml(stroke_data)
-            elif self.classification_method == 'hybrid':
-                return self._classify_hybrid(stroke_data)
+            # 提取特征
+            features = self._extract_classification_features(stroke)
+            feature_vector = np.array([features[name] for name in self.feature_names]).reshape(1, -1)
+            
+            if self.is_trained and self.classifier is not None:
+                # 使用机器学习分类器
+                result = self._ml_classify(feature_vector, features)
             else:
-                self.logger.error(f"Unknown classification method: {self.classification_method}")
-                return self._create_default_result()
-                
+                # 使用基于规则的分类器
+                result = self.rule_based_classifier.classify(stroke, features)
+            
+            return result
+            
         except Exception as e:
-            self.logger.error(f"Error classifying stroke: {str(e)}")
-            return self._create_default_result()
-    
-    def _classify_by_rules(self, stroke_data: Dict[str, Any]) -> ClassificationResult:
-        """
-        基于规则的笔画分类
-        
-        Args:
-            stroke_data (Dict): 笔画数据
-            
-        Returns:
-            ClassificationResult: 分类结果
-        """
-        try:
-            from utils.math_utils import ensure_scalar
-            
-            # 提取关键特征，确保都是标量值
-            aspect_ratio_val = stroke_data.get('aspect_ratio', 1.0)
-            aspect_ratio = ensure_scalar(aspect_ratio_val, default=1.0)
-            
-            orientation = ensure_scalar(stroke_data.get('orientation', 0.0), default=0.0)
-            curvature_mean = ensure_scalar(stroke_data.get('curvature_mean', 0.0), default=0.0)
-            curvature_std = ensure_scalar(stroke_data.get('curvature_std', 0.0), default=0.0)
-            length = ensure_scalar(stroke_data.get('length', 0.0), default=0.0)
-            area = ensure_scalar(stroke_data.get('area', 0.0), default=0.0)
-            # 规则分类逻辑
-            class_scores = {}
-            # 点（小面积，接近圆形）
-            if area < 100 and aspect_ratio < 1.5:
-                class_scores['dot'] = 0.9
-            # 横（水平方向，长宽比大）
-            elif aspect_ratio > 3 and abs(orientation) < math.pi/6:
-                class_scores['horizontal'] = 0.8 + min(0.2, aspect_ratio / 10)
-            # 竖（垂直方向，长宽比大）
-            elif aspect_ratio > 3 and abs(abs(orientation) - math.pi/2) < math.pi/6:
-                class_scores['vertical'] = 0.8 + min(0.2, aspect_ratio / 10)
-            # 撇（左下方向）
-            elif (orientation > math.pi/4 and orientation < 3*math.pi/4 and 
-                  aspect_ratio > 2):
-                class_scores['left_falling'] = 0.7 + min(0.3, curvature_mean * 2)
-            # 捺（右下方向）
-            elif (orientation > -3*math.pi/4 and orientation < -math.pi/4 and 
-                  aspect_ratio > 2):
-                class_scores['right_falling'] = 0.7 + min(0.3, curvature_mean * 2)
-            # 钩（高曲率变化）
-            elif curvature_std > 0.5:
-                class_scores['hook'] = 0.6 + min(0.4, curvature_std)
-            # 折（中等曲率，角度变化）
-            elif curvature_mean > 0.3 and curvature_std > 0.2:
-                class_scores['turning'] = 0.6 + min(0.3, curvature_mean)
-            # 弯（平滑曲线）
-            elif curvature_mean > 0.2 and curvature_std < 0.3:
-                class_scores['curve'] = 0.5 + min(0.4, curvature_mean)
-            # 复合笔画（复杂形状）
-            else:
-                class_scores['complex'] = 0.5
-            
-            from utils.math_utils import ensure_scalar
-            
-            # 找到最高分类别
-            if class_scores:
-                predicted_class = max(class_scores.keys(), key=lambda k: class_scores[k])
-                confidence = ensure_scalar(class_scores[predicted_class], default=0.5)
-            else:
-                predicted_class = 'complex'
-                confidence = 0.5
-                class_scores = {'complex': 0.5}
-            
-            # 归一化概率
-            total_score = ensure_scalar(sum(class_scores.values()), default=1.0)
-            if total_score > 0:
-                class_probabilities = {k: ensure_scalar(v/total_score, default=0.0) 
-                                     for k, v in class_scores.items()}
-            else:
-                class_probabilities = class_scores
-            
+            self.logger.error(f"Error classifying stroke {stroke.id}: {e}")
             return ClassificationResult(
-                predicted_class=predicted_class,
-                confidence=confidence,
-                class_probabilities=class_probabilities,
-                features_used=['aspect_ratio', 'orientation', 'curvature_mean', 'curvature_std'],
-                classification_details={
-                    'method': 'rule_based',
-                    'raw_scores': class_scores
-                }
+                category=StrokeCategory.UNKNOWN,
+                confidence=0.0,
+                probabilities={cat: 0.0 for cat in StrokeCategory},
+                features_used=self.feature_names,
+                classification_details={'error': str(e)}
             )
-        except Exception as e:
-            self.logger.error(f"Error in rule-based classification: {str(e)}")
-            return self._create_default_result()
     
-    def _classify_by_ml(self, stroke_data: Dict[str, Any]) -> ClassificationResult:
+    def classify_strokes(self, strokes: List[Stroke]) -> List[ClassificationResult]:
         """
-        基于机器学习的笔画分类
+        批量分类笔触
         
         Args:
-            stroke_data (Dict): 笔画数据
+            strokes: 笔触列表
             
         Returns:
-            ClassificationResult: 分类结果
+            分类结果列表
         """
+        results = []
+        
+        if not strokes:
+            return results
+        
         try:
-            if self.ml_model is None:
-                self.logger.warning("ML model not loaded, falling back to rule-based classification")
-                return self._classify_by_rules(stroke_data)
+            # 批量提取特征
+            all_features = []
+            feature_dicts = []
             
-            # 提取特征向量
-            feature_vector = self._extract_feature_vector(stroke_data)
+            for stroke in strokes:
+                features = self._extract_classification_features(stroke)
+                feature_vector = [features[name] for name in self.feature_names]
+                all_features.append(feature_vector)
+                feature_dicts.append(features)
             
-            if feature_vector is None or len(feature_vector) == 0:
-                self.logger.warning("Failed to extract features, using default classification")
-                return self._create_default_result()
+            feature_matrix = np.array(all_features)
             
-            # 特征标准化
-            if self.feature_scaler:
-                feature_vector = self.feature_scaler.transform([feature_vector])
+            if self.is_trained and self.classifier is not None:
+                # 使用机器学习分类器批量处理
+                results = self._ml_classify_batch(feature_matrix, feature_dicts)
             else:
-                feature_vector = [feature_vector]
-            
-            from utils.math_utils import ensure_scalar
-            
-            # 预测
-            predicted_class_idx = self.ml_model.predict(feature_vector)[0]
-            predicted_class = self.stroke_classes[predicted_class_idx]
-            
-            # 获取概率
-            if hasattr(self.ml_model, 'predict_proba'):
-                probabilities = self.ml_model.predict_proba(feature_vector)[0]
-                # 确保概率值是标量
-                class_probabilities = {self.stroke_classes[i]: ensure_scalar(prob, default=0.0) 
-                                     for i, prob in enumerate(probabilities)}
-                confidence = ensure_scalar(max(probabilities), default=0.5)
-            else:
-                class_probabilities = {predicted_class: 1.0}
-                confidence = 1.0
-            
-            return ClassificationResult(
-                predicted_class=predicted_class,
-                confidence=confidence,
-                class_probabilities=class_probabilities,
-                features_used=self._get_feature_names(),
-                classification_details={
-                    'method': 'ml_based',
-                    'model_type': type(self.ml_model).__name__
-                }
-            )
+                # 使用基于规则的分类器
+                for i, stroke in enumerate(strokes):
+                    result = self.rule_based_classifier.classify(stroke, feature_dicts[i])
+                    results.append(result)
             
         except Exception as e:
-            self.logger.error(f"Error in ML-based classification: {str(e)}")
-            return self._create_default_result()
+            self.logger.error(f"Error in batch classification: {e}")
+            # 回退到单个分类
+            for stroke in strokes:
+                result = self.classify_stroke(stroke)
+                results.append(result)
+        
+        return results
     
-    def _classify_hybrid(self, stroke_data: Dict[str, Any]) -> ClassificationResult:
+    def train_classifier(self, training_data: List[Tuple[Stroke, StrokeCategory]], 
+                        validation_split: float = 0.2) -> Dict[str, Any]:
         """
-        混合分类方法
+        训练分类器
         
         Args:
-            stroke_data (Dict): 笔画数据
+            training_data: 训练数据 [(stroke, category), ...]
+            validation_split: 验证集比例
             
         Returns:
-            ClassificationResult: 分类结果
+            训练结果统计
         """
-        try:
-            # 获取规则分类结果
-            rule_result = self._classify_by_rules(stroke_data)
-            
-            # 获取ML分类结果
-            ml_result = self._classify_by_ml(stroke_data)
-            
-            # 融合结果
-            if rule_result.confidence > self.confidence_threshold:
-                # 规则分类置信度高，使用规则结果
-                final_result = rule_result
-                final_result.classification_details['method'] = 'hybrid_rule_dominant'
-            elif ml_result.confidence > self.confidence_threshold:
-                # ML分类置信度高，使用ML结果
-                final_result = ml_result
-                final_result.classification_details['method'] = 'hybrid_ml_dominant'
-            else:
-                # 两者置信度都不高，加权融合
-                final_result = self._fuse_classification_results(rule_result, ml_result)
-                final_result.classification_details['method'] = 'hybrid_fused'
-            
-            return final_result
-            
-        except Exception as e:
-            self.logger.error(f"Error in hybrid classification: {str(e)}")
-            return self._create_default_result()
-    
-    def _fuse_classification_results(self, result1: ClassificationResult, 
-                                   result2: ClassificationResult) -> ClassificationResult:
-        """
-        融合两个分类结果
+        if len(training_data) < 10:
+            raise ValueError("Training data too small (minimum 10 samples required)")
         
-        Args:
-            result1 (ClassificationResult): 分类结果1
-            result2 (ClassificationResult): 分类结果2
-            
-        Returns:
-            ClassificationResult: 融合结果
-        """
         try:
-            from utils.math_utils import ensure_scalar
-            
-            # 加权融合概率
-            weight1 = ensure_scalar(result1.confidence, default=0.0)
-            weight2 = ensure_scalar(result2.confidence, default=0.0)
-            total_weight = ensure_scalar(weight1 + weight2, default=1.0)
-            
-            if total_weight == 0:
-                return self._create_default_result()
-            
-            # 归一化权重
-            weight1 = ensure_scalar(weight1 / total_weight, default=0.5)
-            weight2 = ensure_scalar(weight2 / total_weight, default=0.5)
-            
-            # 融合类别概率
-            all_classes = set(result1.class_probabilities.keys()) | set(result2.class_probabilities.keys())
-            fused_probabilities = {}
-            
-            for class_name in all_classes:
-                prob1 = ensure_scalar(result1.class_probabilities.get(class_name, 0.0), default=0.0)
-                prob2 = ensure_scalar(result2.class_probabilities.get(class_name, 0.0), default=0.0)
-                fused_prob = ensure_scalar(weight1 * prob1 + weight2 * prob2, default=0.0)
-                fused_probabilities[class_name] = fused_prob
-            
-            # 找到最高概率类别
-            predicted_class = max(fused_probabilities.keys(), key=lambda k: fused_probabilities[k])
-            confidence = ensure_scalar(fused_probabilities[predicted_class], default=0.5)
-            
-            # 合并使用的特征
-            features_used = list(set(result1.features_used + result2.features_used))
-            
-            return ClassificationResult(
-                predicted_class=predicted_class,
-                confidence=confidence,
-                class_probabilities=fused_probabilities,
-                features_used=features_used,
-                classification_details={
-                    'method': 'fused',
-                    'fusion_weights': {'result1': weight1, 'result2': weight2},
-                    'original_results': {
-                        'result1': result1.predicted_class,
-                        'result2': result2.predicted_class
-                    }
-                }
-            )
-            
-        except Exception as e:
-            self.logger.error(f"Error fusing classification results: {str(e)}")
-            return self._create_default_result()
-    
-    def train_ml_model(self, training_data: List[Tuple[Dict[str, Any], str]], 
-                      model_type: str = 'random_forest') -> bool:
-        """
-        训练机器学习模型
-        
-        Args:
-            training_data (List): 训练数据，(特征, 标签)对的列表
-            model_type (str): 模型类型
-            
-        Returns:
-            bool: 是否训练成功
-        """
-        try:
-            if len(training_data) == 0:
-                self.logger.error("No training data provided")
-                return False
-            
-            from utils.math_utils import ensure_scalar
-            
             # 提取特征和标签
             X = []
             y = []
             
-            for features, label in training_data:
-                feature_vector = self._extract_feature_vector(features)
-                if feature_vector is not None:
-                    # 确保特征向量中的每个值都是标量
-                    feature_vector = [ensure_scalar(x, default=0.0) for x in feature_vector]
-                    X.append(feature_vector)
-                    y.append(label)
+            for stroke, category in training_data:
+                features = self._extract_classification_features(stroke)
+                feature_vector = [features[name] for name in self.feature_names]
+                X.append(feature_vector)
+                y.append(category.value)
             
-            if len(X) == 0:
-                self.logger.error("No valid features extracted from training data")
-                return False
-            
-            # 转换为numpy数组并确保数值类型
-            X = np.array(X, dtype=np.float32)
+            X = np.array(X)
             y = np.array(y)
             
-            # 特征标准化
-            self.feature_scaler = StandardScaler()
-            X_scaled = self.feature_scaler.fit_transform(X)
-            
-            # 分割训练和测试数据
-            X_train, X_test, y_train, y_test = train_test_split(
-                X_scaled, y, test_size=0.2, random_state=42, stratify=y
+            # 分割训练集和验证集
+            X_train, X_val, y_train, y_val = train_test_split(
+                X, y, test_size=validation_split, random_state=42, stratify=y
             )
             
-            # 创建模型
-            if model_type == 'random_forest':
-                self.ml_model = RandomForestClassifier(
-                    n_estimators=100, random_state=42, class_weight='balanced'
+            # 特征标准化
+            self.scaler.fit(X_train)
+            X_train_scaled = self.scaler.transform(X_train)
+            X_val_scaled = self.scaler.transform(X_val)
+            
+            # 初始化分类器
+            if self.classifier_type == 'random_forest':
+                self.classifier = RandomForestClassifier(
+                    n_estimators=100,
+                    max_depth=10,
+                    random_state=42,
+                    class_weight='balanced'
                 )
-            elif model_type == 'svm':
-                self.ml_model = SVC(
-                    kernel='rbf', probability=True, random_state=42, class_weight='balanced'
+            elif self.classifier_type == 'svm':
+                self.classifier = SVC(
+                    kernel='rbf',
+                    probability=True,
+                    random_state=42,
+                    class_weight='balanced'
                 )
             else:
-                self.logger.error(f"Unknown model type: {model_type}")
-                return False
+                raise ValueError(f"Unsupported classifier type: {self.classifier_type}")
             
             # 训练模型
-            self.ml_model.fit(X_train, y_train)
+            self.classifier.fit(X_train_scaled, y_train)
             
-            # 评估模型
-            y_pred = self.ml_model.predict(X_test)
-            accuracy = accuracy_score(y_test, y_pred)
+            # 验证模型
+            y_pred = self.classifier.predict(X_val_scaled)
+            accuracy = accuracy_score(y_val, y_pred)
             
-            self.logger.info(f"Model trained with accuracy: {accuracy:.3f}")
-            self.logger.info(f"Classification report:\n{classification_report(y_test, y_pred)}")
+            # 生成分类报告
+            report = classification_report(y_val, y_pred, output_dict=True)
             
             # 保存模型
-            self._save_models()
+            self._save_model()
             
+            self.is_trained = True
+            
+            training_stats = {
+                'accuracy': accuracy,
+                'training_samples': len(X_train),
+                'validation_samples': len(X_val),
+                'classification_report': report,
+                'feature_names': self.feature_names
+            }
+            
+            self.logger.info(f"Classifier trained successfully. Accuracy: {accuracy:.3f}")
+            return training_stats
+            
+        except Exception as e:
+            self.logger.error(f"Error training classifier: {e}")
+            raise
+    
+    def update_classifier(self, new_data: List[Tuple[Stroke, StrokeCategory]]) -> bool:
+        """
+        增量更新分类器
+        
+        Args:
+            new_data: 新的训练数据
+            
+        Returns:
+            是否成功更新
+        """
+        try:
+            if not self.is_trained:
+                self.logger.warning("Classifier not trained yet. Use train_classifier first.")
+                return False
+            
+            # 提取新特征
+            X_new = []
+            y_new = []
+            
+            for stroke, category in new_data:
+                features = self._extract_classification_features(stroke)
+                feature_vector = [features[name] for name in self.feature_names]
+                X_new.append(feature_vector)
+                y_new.append(category.value)
+            
+            X_new = np.array(X_new)
+            y_new = np.array(y_new)
+            
+            # 标准化新特征
+            X_new_scaled = self.scaler.transform(X_new)
+            
+            # 对于支持增量学习的分类器，可以使用partial_fit
+            # 这里简化为重新训练（在实际应用中可以优化）
+            if hasattr(self.classifier, 'partial_fit'):
+                self.classifier.partial_fit(X_new_scaled, y_new)
+            else:
+                self.logger.info("Classifier doesn't support incremental learning. Consider retraining.")
+                return False
+            
+            # 保存更新后的模型
+            self._save_model()
+            
+            self.logger.info(f"Classifier updated with {len(new_data)} new samples")
             return True
             
         except Exception as e:
-            self.logger.error(f"Error training ML model: {str(e)}")
+            self.logger.error(f"Error updating classifier: {e}")
             return False
     
-    def _extract_feature_vector(self, stroke_data: Dict[str, Any]) -> Optional[np.ndarray]:
+    def get_feature_importance(self) -> Dict[str, float]:
         """
-        从笔画数据中提取特征向量
-        
-        Args:
-            stroke_data (Dict): 笔画数据
-            
-        Returns:
-            np.ndarray: 特征向量
-        """
-        try:
-            features = []
-            
-            # 几何特征
-            features.extend([
-                stroke_data.get('area', 0.0),
-                stroke_data.get('perimeter', 0.0),
-                stroke_data.get('aspect_ratio', 1.0),
-                stroke_data.get('extent', 0.0),
-                stroke_data.get('solidity', 0.0),
-                stroke_data.get('circularity', 0.0),
-                stroke_data.get('rectangularity', 0.0)
-            ])
-            
-            # 方向特征
-            features.extend([
-                stroke_data.get('orientation', 0.0),
-                stroke_data.get('major_axis_length', 0.0),
-                stroke_data.get('minor_axis_length', 0.0),
-                stroke_data.get('eccentricity', 0.0)
-            ])
-            
-            # 曲率特征
-            features.extend([
-                stroke_data.get('curvature_mean', 0.0),
-                stroke_data.get('curvature_std', 0.0),
-                stroke_data.get('curvature_max', 0.0),
-                stroke_data.get('curvature_min', 0.0)
-            ])
-            
-            # 纹理特征
-            texture_features = stroke_data.get('texture_features', {})
-            features.extend([
-                texture_features.get('contrast', 0.0),
-                texture_features.get('energy', 0.0),
-                texture_features.get('homogeneity', 0.0),
-                texture_features.get('correlation', 0.0)
-            ])
-            
-            # 动态特征统计
-            width_profile = stroke_data.get('width_profile')
-            if width_profile is not None and len(width_profile) > 0:
-                features.extend([
-                    np.mean(width_profile),
-                    np.std(width_profile),
-                    np.max(width_profile),
-                    np.min(width_profile)
-                ])
-            else:
-                features.extend([0.0, 0.0, 0.0, 0.0])
-            
-            return np.array(features, dtype=np.float32)
-            
-        except Exception as e:
-            self.logger.error(f"Error extracting feature vector: {str(e)}")
-            return None
-    
-    def _get_feature_names(self) -> List[str]:
-        """
-        获取特征名称列表
+        获取特征重要性
         
         Returns:
-            List[str]: 特征名称
+            特征重要性字典
         """
-        return [
-            'area', 'perimeter', 'aspect_ratio', 'extent', 'solidity', 'circularity', 'rectangularity',
-            'orientation', 'major_axis_length', 'minor_axis_length', 'eccentricity',
-            'curvature_mean', 'curvature_std', 'curvature_max', 'curvature_min',
-            'texture_contrast', 'texture_energy', 'texture_homogeneity', 'texture_correlation',
-            'width_mean', 'width_std', 'width_max', 'width_min'
-        ]
-    
-    def _load_models(self):
-        """
-        加载预训练模型
-        """
-        try:
-            model_path = Path(self.model_path)
-            scaler_path = Path(self.scaler_path)
-            
-            if model_path.exists():
-                self.ml_model = joblib.load(model_path)
-                self.logger.info(f"Loaded ML model from {model_path}")
-            
-            if scaler_path.exists():
-                self.feature_scaler = joblib.load(scaler_path)
-                self.logger.info(f"Loaded feature scaler from {scaler_path}")
-                
-        except Exception as e:
-            self.logger.warning(f"Error loading models: {str(e)}")
-    
-    def _save_models(self):
-        """
-        保存训练好的模型
-        """
-        try:
-            model_path = Path(self.model_path)
-            scaler_path = Path(self.scaler_path)
-            
-            # 确保目录存在
-            model_path.parent.mkdir(parents=True, exist_ok=True)
-            scaler_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            if self.ml_model:
-                joblib.dump(self.ml_model, model_path)
-                self.logger.info(f"Saved ML model to {model_path}")
-            
-            if self.feature_scaler:
-                joblib.dump(self.feature_scaler, scaler_path)
-                self.logger.info(f"Saved feature scaler to {scaler_path}")
-                
-        except Exception as e:
-            self.logger.error(f"Error saving models: {str(e)}")
-    
-    def _create_default_result(self) -> ClassificationResult:
-        """
-        创建默认分类结果
-        
-        Returns:
-            ClassificationResult: 默认结果
-        """
-        return ClassificationResult(
-            predicted_class='complex',
-            confidence=0.5,
-            class_probabilities={'complex': 1.0},
-            features_used=[],
-            classification_details={'method': 'default'}
-        )
-    
-    def get_class_statistics(self, classification_results: List[ClassificationResult]) -> Dict[str, Any]:
-        """
-        获取分类统计信息
-        
-        Args:
-            classification_results (List): 分类结果列表
-            
-        Returns:
-            Dict: 统计信息
-        """
-        try:
-            if not classification_results:
-                return {}
-            
-            # 统计各类别数量
-            class_counts = {}
-            confidence_sum = {}
-            
-            for result in classification_results:
-                class_name = result.predicted_class
-                class_counts[class_name] = class_counts.get(class_name, 0) + 1
-                confidence_sum[class_name] = confidence_sum.get(class_name, 0) + result.confidence
-            
-            # 计算平均置信度
-            avg_confidence = {}
-            for class_name, count in class_counts.items():
-                avg_confidence[class_name] = confidence_sum[class_name] / count
-            
-            # 总体统计
-            total_strokes = len(classification_results)
-            overall_confidence = sum(r.confidence for r in classification_results) / total_strokes
-            
-            return {
-                'total_strokes': total_strokes,
-                'class_distribution': class_counts,
-                'class_percentages': {k: v/total_strokes*100 for k, v in class_counts.items()},
-                'average_confidence_by_class': avg_confidence,
-                'overall_average_confidence': overall_confidence,
-                'most_common_class': max(class_counts.keys(), key=lambda k: class_counts[k]),
-                'least_common_class': min(class_counts.keys(), key=lambda k: class_counts[k])
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Error computing class statistics: {str(e)}")
+        if not self.is_trained or self.classifier is None:
             return {}
+        
+        try:
+            if hasattr(self.classifier, 'feature_importances_'):
+                importances = self.classifier.feature_importances_
+                return dict(zip(self.feature_names, importances))
+            else:
+                self.logger.warning("Classifier doesn't support feature importance")
+                return {}
+                
+        except Exception as e:
+            self.logger.error(f"Error getting feature importance: {e}")
+            return {}
+    
+    def _extract_classification_features(self, stroke: Stroke) -> Dict[str, float]:
+        """
+        提取分类特征
+        
+        Args:
+            stroke: 笔触
+            
+        Returns:
+            特征字典
+        """
+        # 基本几何特征
+        features = {
+            'area': stroke.area,
+            'perimeter': stroke.perimeter,
+            'length': stroke.length,
+            'width': stroke.width,
+            'aspect_ratio': stroke.length / max(stroke.width, 1e-6),
+            'position_x': stroke.center[0],
+            'position_y': stroke.center[1]
+        }
+        
+        # 计算额外特征
+        try:
+            # 紧实度 (4π*面积/周长²)
+            features['compactness'] = float((4 * np.pi * stroke.area) / max(stroke.perimeter ** 2, 1e-6))
+            
+            # 凸性 (凸包面积/实际面积)
+            if hasattr(stroke, 'convex_hull_area'):
+                features['convexity'] = stroke.area / max(stroke.convex_hull_area, 1e-6)
+            else:
+                features['convexity'] = 0.8  # 默认值
+            
+            # 实体性 (面积/边界框面积)
+            bbox_area = stroke.length * stroke.width
+            features['solidity'] = stroke.area / max(bbox_area, 1e-6)
+            
+            # 范围 (面积/边界框面积的另一种计算)
+            features['extent'] = features['solidity']
+            
+            # 方向 (主轴角度)
+            features['orientation'] = stroke.angle
+            
+            # 偏心率 (基于椭圆拟合)
+            features['eccentricity'] = self._calculate_eccentricity(stroke)
+            
+            # 粗糙度 (周长²/面积)
+            features['roughness'] = (stroke.perimeter ** 2) / max(stroke.area, 1e-6)
+            
+            # 对称性 (简化计算)
+            features['symmetry'] = self._calculate_symmetry(stroke)
+            
+            # 相对大小 (相对于图像的大小)
+            if hasattr(stroke, 'image_size'):
+                image_area = stroke.image_size[0] * stroke.image_size[1]
+                features['relative_size'] = stroke.area / max(image_area, 1e-6)
+            else:
+                features['relative_size'] = 0.01  # 默认值
+            
+            # 密度 (面积/凸包面积)
+            features['density'] = features['convexity']
+            
+        except Exception as e:
+            self.logger.warning(f"Error calculating additional features: {e}")
+            # 设置默认值
+            default_features = {
+                'compactness': 0.5,
+                'convexity': 0.8,
+                'solidity': 0.7,
+                'extent': 0.7,
+                'orientation': 0.0,
+                'eccentricity': 0.5,
+                'roughness': 1.0,
+                'symmetry': 0.5,
+                'relative_size': 0.01,
+                'density': 0.8
+            }
+            features.update(default_features)
+        
+        return features
+    
+    def _calculate_eccentricity(self, stroke: Stroke) -> float:
+        """
+        计算偏心率
+        
+        Args:
+            stroke: 笔触
+            
+        Returns:
+            偏心率
+        """
+        try:
+            # 简化计算：基于长宽比
+            aspect_ratio = stroke.length / max(stroke.width, 1e-6)
+            # 将长宽比转换为偏心率 (0-1)
+            eccentricity = min(1.0, (aspect_ratio - 1.0) / max(aspect_ratio, 1.0))
+            return eccentricity
+        except:
+            return 0.5
+    
+    def _calculate_symmetry(self, stroke: Stroke) -> float:
+        """
+        计算对称性
+        
+        Args:
+            stroke: 笔触
+            
+        Returns:
+            对称性分数
+        """
+        try:
+            # 简化实现：基于形状的规则性
+            compactness = (4 * np.pi * stroke.area) / max(stroke.perimeter ** 2, 1e-6)
+            return min(1.0, compactness * 2)  # 越紧实越对称
+        except:
+            return 0.5
+    
+    def _ml_classify(self, feature_vector: np.ndarray, 
+                    features: Dict[str, float]) -> ClassificationResult:
+        """
+        使用机器学习分类器进行分类
+        
+        Args:
+            feature_vector: 特征向量
+            features: 特征字典
+            
+        Returns:
+            分类结果
+        """
+        try:
+            # 标准化特征
+            feature_scaled = self.scaler.transform(feature_vector)
+            
+            # 预测类别
+            predicted_class = self.classifier.predict(feature_scaled)[0]
+            
+            # 获取概率
+            if hasattr(self.classifier, 'predict_proba'):
+                probabilities = self.classifier.predict_proba(feature_scaled)[0]
+                class_names = self.classifier.classes_
+                prob_dict = {}
+                for i, class_name in enumerate(class_names):
+                    try:
+                        category = StrokeCategory(class_name)
+                        prob_dict[category] = probabilities[i]
+                    except ValueError:
+                        continue
+                
+                confidence = max(probabilities)
+            else:
+                prob_dict = {StrokeCategory(predicted_class): 1.0}
+                confidence = 1.0
+            
+            # 转换预测类别
+            try:
+                predicted_category = StrokeCategory(predicted_class)
+            except ValueError:
+                predicted_category = StrokeCategory.UNKNOWN
+                confidence = 0.0
+            
+            return ClassificationResult(
+                category=predicted_category,
+                confidence=confidence,
+                probabilities=prob_dict,
+                features_used=self.feature_names,
+                classification_details={
+                    'method': 'machine_learning',
+                    'classifier_type': self.classifier_type,
+                    'features': features
+                }
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error in ML classification: {e}")
+            return ClassificationResult(
+                category=StrokeCategory.UNKNOWN,
+                confidence=0.0,
+                probabilities={cat: 0.0 for cat in StrokeCategory},
+                features_used=self.feature_names,
+                classification_details={'error': str(e)}
+            )
+    
+    def _ml_classify_batch(self, feature_matrix: np.ndarray, 
+                          feature_dicts: List[Dict[str, float]]) -> List[ClassificationResult]:
+        """
+        批量机器学习分类
+        
+        Args:
+            feature_matrix: 特征矩阵
+            feature_dicts: 特征字典列表
+            
+        Returns:
+            分类结果列表
+        """
+        try:
+            # 标准化特征
+            features_scaled = self.scaler.transform(feature_matrix)
+            
+            # 批量预测
+            predicted_classes = self.classifier.predict(features_scaled)
+            
+            if hasattr(self.classifier, 'predict_proba'):
+                probabilities_matrix = self.classifier.predict_proba(features_scaled)
+                class_names = self.classifier.classes_
+            else:
+                probabilities_matrix = None
+                class_names = None
+            
+            results = []
+            for i, predicted_class in enumerate(predicted_classes):
+                # 处理概率
+                if probabilities_matrix is not None:
+                    probabilities = probabilities_matrix[i]
+                    prob_dict = {}
+                    for j, class_name in enumerate(class_names):
+                        try:
+                            category = StrokeCategory(class_name)
+                            prob_dict[category] = probabilities[j]
+                        except ValueError:
+                            continue
+                    confidence = max(probabilities)
+                else:
+                    prob_dict = {StrokeCategory(predicted_class): 1.0}
+                    confidence = 1.0
+                
+                # 转换预测类别
+                try:
+                    predicted_category = StrokeCategory(predicted_class)
+                except ValueError:
+                    predicted_category = StrokeCategory.UNKNOWN
+                    confidence = 0.0
+                
+                result = ClassificationResult(
+                    category=predicted_category,
+                    confidence=confidence,
+                    probabilities=prob_dict,
+                    features_used=self.feature_names,
+                    classification_details={
+                        'method': 'machine_learning_batch',
+                        'classifier_type': self.classifier_type,
+                        'features': feature_dicts[i]
+                    }
+                )
+                results.append(result)
+            
+            return results
+            
+        except Exception as e:
+            self.logger.error(f"Error in batch ML classification: {e}")
+            # 回退到单个分类
+            results = []
+            for i in range(len(feature_matrix)):
+                feature_vector = feature_matrix[i:i+1]
+                result = self._ml_classify(feature_vector, feature_dicts[i])
+                results.append(result)
+            return results
+    
+    def _save_model(self):
+        """保存模型"""
+        try:
+            # 确保目录存在
+            Path(self.model_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(self.scaler_path).parent.mkdir(parents=True, exist_ok=True)
+            
+            # 保存分类器
+            joblib.dump(self.classifier, self.model_path)
+            
+            # 保存标准化器
+            joblib.dump(self.scaler, self.scaler_path)
+            
+            self.logger.info(f"Model saved to {self.model_path}")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving model: {e}")
+    
+    def _load_model(self):
+        """加载模型"""
+        try:
+            if Path(self.model_path).exists() and Path(self.scaler_path).exists():
+                # 加载分类器
+                self.classifier = joblib.load(self.model_path)
+                
+                # 加载标准化器
+                self.scaler = joblib.load(self.scaler_path)
+                
+                self.is_trained = True
+                self.logger.info(f"Model loaded from {self.model_path}")
+            else:
+                self.logger.info("No pre-trained model found")
+                
+        except Exception as e:
+            self.logger.warning(f"Error loading model: {e}")
+            self.is_trained = False
+
+
+class RuleBasedClassifier:
+    """基于规则的笔触分类器"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        """
+        初始化基于规则的分类器
+        
+        Args:
+            config: 配置参数
+        """
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+        
+        # 分类规则阈值
+        self.thresholds = config.get('rule_thresholds', {
+            'large_area_ratio': 0.1,      # 大面积阈值
+            'thin_aspect_ratio': 5.0,     # 细长比阈值
+            'small_area_ratio': 0.001,    # 小面积阈值
+            'edge_distance_ratio': 0.1,   # 边缘距离阈值
+            'high_roughness': 2.0,        # 高粗糙度阈值
+            'low_compactness': 0.3        # 低紧实度阈值
+        })
+    
+    def classify(self, stroke: Stroke, features: Dict[str, float]) -> ClassificationResult:
+        """
+        基于规则分类笔触
+        
+        Args:
+            stroke: 笔触
+            features: 特征字典
+            
+        Returns:
+            分类结果
+        """
+        try:
+            # 应用分类规则
+            category, confidence, reasoning = self._apply_rules(features)
+            
+            # 构建概率分布
+            probabilities = {cat: 0.0 for cat in StrokeCategory}
+            probabilities[category] = confidence
+            
+            return ClassificationResult(
+                category=category,
+                confidence=confidence,
+                probabilities=probabilities,
+                features_used=list(features.keys()),
+                classification_details={
+                    'method': 'rule_based',
+                    'reasoning': reasoning,
+                    'features': features
+                }
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error in rule-based classification: {e}")
+            return ClassificationResult(
+                category=StrokeCategory.UNKNOWN,
+                confidence=0.0,
+                probabilities={cat: 0.0 for cat in StrokeCategory},
+                features_used=list(features.keys()),
+                classification_details={'error': str(e)}
+            )
+    
+    def _apply_rules(self, features: Dict[str, float]) -> Tuple[StrokeCategory, float, str]:
+        """
+        应用分类规则
+        
+        Args:
+            features: 特征字典
+            
+        Returns:
+            (分类, 置信度, 推理过程)
+        """
+        reasoning = []
+        
+        # 规则1: 大面积 -> 填充或背景
+        if features.get('relative_size', 0) > self.thresholds['large_area_ratio']:
+            reasoning.append("Large area detected")
+            if features.get('position_x', 0.5) < 0.2 or features.get('position_x', 0.5) > 0.8:
+                return StrokeCategory.BACKGROUND, 0.8, "; ".join(reasoning + ["Edge position -> Background"])
+            else:
+                return StrokeCategory.FILL, 0.7, "; ".join(reasoning + ["Central position -> Fill"])
+        
+        # 规则2: 细长形状 -> 轮廓线
+        if features.get('aspect_ratio', 1) > self.thresholds['thin_aspect_ratio']:
+            reasoning.append("High aspect ratio detected")
+            return StrokeCategory.OUTLINE, 0.8, "; ".join(reasoning + ["Thin shape -> Outline"])
+        
+        # 规则3: 小面积 + 高粗糙度 -> 细节或纹理
+        if (features.get('relative_size', 0) < self.thresholds['small_area_ratio'] and 
+            features.get('roughness', 1) > self.thresholds['high_roughness']):
+            reasoning.append("Small area with high roughness")
+            return StrokeCategory.DETAIL, 0.7, "; ".join(reasoning + ["Small rough -> Detail"])
+        
+        # 规则4: 低紧实度 -> 纹理
+        if features.get('compactness', 0.5) < self.thresholds['low_compactness']:
+            reasoning.append("Low compactness detected")
+            return StrokeCategory.TEXTURE, 0.6, "; ".join(reasoning + ["Irregular shape -> Texture"])
+        
+        # 规则5: 边缘位置 -> 轮廓
+        edge_distance = min(
+            features.get('position_x', 0.5),
+            features.get('position_y', 0.5),
+            1 - features.get('position_x', 0.5),
+            1 - features.get('position_y', 0.5)
+        )
+        if edge_distance < self.thresholds['edge_distance_ratio']:
+            reasoning.append("Near edge position")
+            return StrokeCategory.OUTLINE, 0.6, "; ".join(reasoning + ["Edge position -> Outline"])
+        
+        # 规则6: 中等大小 + 规则形状 -> 前景
+        if (0.001 < features.get('relative_size', 0) < 0.05 and 
+            features.get('compactness', 0) > 0.5):
+            reasoning.append("Medium size with regular shape")
+            return StrokeCategory.FOREGROUND, 0.6, "; ".join(reasoning + ["Regular medium -> Foreground"])
+        
+        # 默认分类
+        reasoning.append("No specific rule matched")
+        return StrokeCategory.UNKNOWN, 0.3, "; ".join(reasoning + ["Default classification"])

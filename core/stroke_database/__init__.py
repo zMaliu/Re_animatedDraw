@@ -1,17 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-笔画库模块
+笔触数据库模块
 
-提供笔画数据库的管理、存储和检索功能
-包含笔画匹配、相似度计算和笔画分类等核心功能
+提供笔触的存储、检索、匹配和分类功能
 """
 
-from .stroke_database import StrokeDatabase
-from .stroke_matcher import StrokeMatcher
-from .stroke_classifier import StrokeClassifier
+from .stroke_database import StrokeDatabase, StrokeTemplate
+from .stroke_matcher import StrokeMatcher, MatchResult
+from .stroke_classifier import StrokeClassifier, StrokeCategory, ClassificationResult
 
 __all__ = [
     'StrokeDatabase',
-    'StrokeMatcher', 
-    'StrokeClassifier'
+    'StrokeTemplate',
+    'StrokeMatcher',
+    'MatchResult', 
+    'StrokeClassifier',
+    'StrokeCategory',
+    'ClassificationResult'
 ]

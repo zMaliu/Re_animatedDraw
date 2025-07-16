@@ -1,585 +1,578 @@
 # -*- coding: utf-8 -*-
 """
-笔画数据库
+笔触数据库模块
 
-管理笔画模板库，提供笔画存储、检索和匹配功能
-支持从数字化艺术家绘制的笔画中构建笔画库
+提供笔触的存储、检索和管理功能
 """
 
-import os
-import json
+import sqlite3
 import pickle
 import numpy as np
-import cv2
-from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass, asdict
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass
 from pathlib import Path
 import logging
-from datetime import datetime
+from ..stroke_extraction.stroke_detector import Stroke
 
 
 @dataclass
 class StrokeTemplate:
-    """
-    笔画模板数据结构
-    
-    Attributes:
-        id (str): 笔画唯一标识
-        category (str): 笔画类别
-        skeleton (np.ndarray): 骨架点序列
-        contour (np.ndarray): 轮廓点序列
-        width_profile (np.ndarray): 宽度变化曲线
-        pressure_profile (np.ndarray): 压力变化曲线
-        velocity_profile (np.ndarray): 速度变化曲线
-        features (Dict): 特征向量
-        metadata (Dict): 元数据信息
-        creation_time (str): 创建时间
-    """
-    id: str
+    """笔触模板数据结构"""
+    id: int
+    name: str
     category: str
-    skeleton: np.ndarray
-    contour: np.ndarray
-    width_profile: np.ndarray
-    pressure_profile: np.ndarray
-    velocity_profile: np.ndarray
     features: Dict[str, Any]
+    contour: np.ndarray
+    skeleton: np.ndarray
     metadata: Dict[str, Any]
-    creation_time: str
+    similarity_threshold: float = 0.7
+    
+    def __post_init__(self):
+        """后处理初始化"""
+        if self.metadata is None:
+            self.metadata = {}
 
 
 class StrokeDatabase:
-    """
-    笔画数据库
+    """笔触数据库管理器"""
     
-    管理笔画模板的存储、检索和匹配
-    """
-    
-    def __init__(self, config, database_path: str = None):
+    def __init__(self, config: Dict[str, Any], database_path: str = None):
         """
-        初始化笔画数据库
+        初始化笔触数据库
         
         Args:
-            config: 配置对象
-            database_path (str, optional): 数据库文件路径
+            config: 配置参数
+            database_path: 数据库文件路径
         """
         self.config = config
+        self.database_path = database_path or './data/stroke_database.db'
         self.logger = logging.getLogger(__name__)
         
-        # 数据库路径
-        if database_path is None:
-            database_path = config['stroke_database'].get('database_path', 'data/stroke_database.pkl')
-        self.database_path = Path(database_path)
+        # 确保数据库目录存在
+        Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
         
-        # 笔画模板存储
-        self.templates: Dict[str, StrokeTemplate] = {}
-        self.categories: Dict[str, List[str]] = {}  # 类别到模板ID的映射
-        self.feature_index: Dict[str, np.ndarray] = {}  # 特征索引
+        # 初始化数据库
+        self._init_database()
         
-        # 数据库配置
-        self.max_templates_per_category = config['stroke_database'].get('max_templates_per_category', 1000)
-        self.feature_dimensions = config['stroke_database'].get('feature_dimensions', 128)
-        self.similarity_threshold = config['stroke_database'].get('similarity_threshold', 0.8)
+        # 内存缓存
+        self._template_cache = {}
+        self._feature_cache = {}
         
-        # 加载现有数据库
-        self.load_database()
+    def _init_database(self):
+        """初始化数据库表结构"""
+        try:
+            with sqlite3.connect(self.database_path) as conn:
+                cursor = conn.cursor()
+                
+                # 创建笔触模板表
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS stroke_templates (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        features BLOB,
+                        contour BLOB,
+                        skeleton BLOB,
+                        metadata BLOB,
+                        similarity_threshold REAL DEFAULT 0.7,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                # 创建特征索引表
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS feature_index (
+                        template_id INTEGER,
+                        feature_name TEXT,
+                        feature_value REAL,
+                        FOREIGN KEY (template_id) REFERENCES stroke_templates (id)
+                    )
+                ''')
+                
+                # 创建分类索引
+                cursor.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_category 
+                    ON stroke_templates (category)
+                ''')
+                
+                cursor.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_feature_name 
+                    ON feature_index (feature_name)
+                ''')
+                
+                conn.commit()
+                self.logger.info(f"Database initialized: {self.database_path}")
+                
+        except Exception as e:
+            self.logger.error(f"Error initializing database: {e}")
+            raise
     
-    def add_template(self, template: StrokeTemplate) -> bool:
+    def add_template(self, template: StrokeTemplate) -> int:
         """
-        添加笔画模板
+        添加笔触模板
         
         Args:
-            template (StrokeTemplate): 笔画模板
+            template: 笔触模板
             
         Returns:
-            bool: 是否成功添加
+            模板ID
         """
         try:
-            # 检查模板ID是否已存在
-            if template.id in self.templates:
-                self.logger.warning(f"Template {template.id} already exists, updating...")
-            
-            # 验证模板数据
-            if not self._validate_template(template):
-                self.logger.error(f"Invalid template data for {template.id}")
-                return False
-            
-            # 添加到模板存储
-            self.templates[template.id] = template
-            
-            # 更新类别索引
-            if template.category not in self.categories:
-                self.categories[template.category] = []
-            
-            if template.id not in self.categories[template.category]:
-                self.categories[template.category].append(template.id)
-            
-            # 限制每个类别的模板数量
-            if len(self.categories[template.category]) > self.max_templates_per_category:
-                # 移除最旧的模板
-                oldest_id = self.categories[template.category].pop(0)
-                if oldest_id in self.templates:
-                    del self.templates[oldest_id]
-                self.logger.info(f"Removed oldest template {oldest_id} from category {template.category}")
-            
-            # 更新特征索引
-            self._update_feature_index(template)
-            
-            self.logger.info(f"Added template {template.id} to category {template.category}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error adding template {template.id}: {str(e)}")
-            return False
-    
-    def get_template(self, template_id: str) -> Optional[StrokeTemplate]:
-        """
-        获取指定ID的笔画模板
-        
-        Args:
-            template_id (str): 模板ID
-            
-        Returns:
-            StrokeTemplate: 笔画模板，如果不存在则返回None
-        """
-        return self.templates.get(template_id)
-    
-    def get_templates_by_category(self, category: str) -> List[StrokeTemplate]:
-        """
-        获取指定类别的所有笔画模板
-        
-        Args:
-            category (str): 笔画类别
-            
-        Returns:
-            List[StrokeTemplate]: 笔画模板列表
-        """
-        template_ids = self.categories.get(category, [])
-        return [self.templates[tid] for tid in template_ids if tid in self.templates]
-    
-    def search_similar_templates(self, query_features: Dict[str, Any], 
-                               category: str = None, 
-                               top_k: int = 10) -> List[Tuple[str, float]]:
-        """
-        搜索相似的笔画模板
-        
-        Args:
-            query_features (Dict): 查询特征
-            category (str, optional): 限制搜索的类别
-            top_k (int): 返回前k个最相似的模板
-            
-        Returns:
-            List[Tuple[str, float]]: (模板ID, 相似度)的列表
-        """
-        candidates = []
-        
-        # 确定搜索范围
-        if category:
-            template_ids = self.categories.get(category, [])
-        else:
-            template_ids = list(self.templates.keys())
-        
-        # 计算相似度
-        for template_id in template_ids:
-            if template_id not in self.templates:
-                continue
+            with sqlite3.connect(self.database_path) as conn:
+                cursor = conn.cursor()
                 
-            template = self.templates[template_id]
-            similarity = self._compute_similarity(query_features, template.features)
-            
-            if similarity >= self.similarity_threshold:
-                candidates.append((template_id, similarity))
-        
-        # 按相似度排序
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        
-        return candidates[:top_k]
+                # 序列化数据
+                features_blob = pickle.dumps(template.features)
+                contour_blob = pickle.dumps(template.contour)
+                skeleton_blob = pickle.dumps(template.skeleton)
+                metadata_blob = pickle.dumps(template.metadata)
+                
+                # 插入模板
+                cursor.execute('''
+                    INSERT INTO stroke_templates 
+                    (name, category, features, contour, skeleton, metadata, similarity_threshold)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    template.name,
+                    template.category,
+                    features_blob,
+                    contour_blob,
+                    skeleton_blob,
+                    metadata_blob,
+                    template.similarity_threshold
+                ))
+                
+                template_id = cursor.lastrowid
+                
+                # 添加特征索引
+                self._add_feature_index(cursor, template_id, template.features)
+                
+                conn.commit()
+                
+                # 更新缓存
+                template.id = template_id
+                self._template_cache[template_id] = template
+                
+                self.logger.info(f"Template added: {template.name} (ID: {template_id})")
+                return template_id
+                
+        except Exception as e:
+            self.logger.error(f"Error adding template: {e}")
+            raise
     
-    def remove_template(self, template_id: str) -> bool:
+    def get_template(self, template_id: int) -> Optional[StrokeTemplate]:
         """
-        移除笔画模板
+        获取笔触模板
         
         Args:
-            template_id (str): 模板ID
+            template_id: 模板ID
             
         Returns:
-            bool: 是否成功移除
+            笔触模板或None
+        """
+        # 检查缓存
+        if template_id in self._template_cache:
+            return self._template_cache[template_id]
+        
+        try:
+            with sqlite3.connect(self.database_path) as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute('''
+                    SELECT id, name, category, features, contour, skeleton, 
+                           metadata, similarity_threshold
+                    FROM stroke_templates WHERE id = ?
+                ''', (template_id,))
+                
+                row = cursor.fetchone()
+                if row:
+                    template = self._row_to_template(row)
+                    self._template_cache[template_id] = template
+                    return template
+                
+                return None
+                
+        except Exception as e:
+            self.logger.error(f"Error getting template {template_id}: {e}")
+            return None
+    
+    def search_templates(self, category: str = None, 
+                        feature_filters: Dict[str, Tuple[float, float]] = None,
+                        limit: int = 100) -> List[StrokeTemplate]:
+        """
+        搜索笔触模板
+        
+        Args:
+            category: 分类过滤
+            feature_filters: 特征过滤 {feature_name: (min_value, max_value)}
+            limit: 结果数量限制
+            
+        Returns:
+            匹配的模板列表
         """
         try:
-            if template_id not in self.templates:
-                self.logger.warning(f"Template {template_id} not found")
-                return False
-            
-            template = self.templates[template_id]
-            
-            # 从模板存储中移除
-            del self.templates[template_id]
-            
-            # 从类别索引中移除
-            if template.category in self.categories:
-                if template_id in self.categories[template.category]:
-                    self.categories[template.category].remove(template_id)
+            with sqlite3.connect(self.database_path) as conn:
+                cursor = conn.cursor()
                 
-                # 如果类别为空，移除类别
-                if not self.categories[template.category]:
-                    del self.categories[template.category]
-            
-            # 更新特征索引
-            self._remove_from_feature_index(template_id)
-            
-            self.logger.info(f"Removed template {template_id}")
-            return True
-            
+                # 构建查询
+                query = '''
+                    SELECT DISTINCT t.id, t.name, t.category, t.features, 
+                           t.contour, t.skeleton, t.metadata, t.similarity_threshold
+                    FROM stroke_templates t
+                '''
+                
+                conditions = []
+                params = []
+                
+                if category:
+                    conditions.append('t.category = ?')
+                    params.append(category)
+                
+                if feature_filters:
+                    query += ' JOIN feature_index f ON t.id = f.template_id'
+                    for feature_name, (min_val, max_val) in feature_filters.items():
+                        conditions.append(
+                            'f.feature_name = ? AND f.feature_value BETWEEN ? AND ?'
+                        )
+                        params.extend([feature_name, min_val, max_val])
+                
+                if conditions:
+                    query += ' WHERE ' + ' AND '.join(conditions)
+                
+                query += f' LIMIT {limit}'
+                
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+                
+                templates = []
+                for row in rows:
+                    template = self._row_to_template(row)
+                    templates.append(template)
+                    # 更新缓存
+                    self._template_cache[template.id] = template
+                
+                return templates
+                
         except Exception as e:
-            self.logger.error(f"Error removing template {template_id}: {str(e)}")
+            self.logger.error(f"Error searching templates: {e}")
+            return []
+    
+    def update_template(self, template: StrokeTemplate) -> bool:
+        """
+        更新笔触模板
+        
+        Args:
+            template: 笔触模板
+            
+        Returns:
+            是否成功
+        """
+        try:
+            with sqlite3.connect(self.database_path) as conn:
+                cursor = conn.cursor()
+                
+                # 序列化数据
+                features_blob = pickle.dumps(template.features)
+                contour_blob = pickle.dumps(template.contour)
+                skeleton_blob = pickle.dumps(template.skeleton)
+                metadata_blob = pickle.dumps(template.metadata)
+                
+                # 更新模板
+                cursor.execute('''
+                    UPDATE stroke_templates 
+                    SET name = ?, category = ?, features = ?, contour = ?, 
+                        skeleton = ?, metadata = ?, similarity_threshold = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                ''', (
+                    template.name,
+                    template.category,
+                    features_blob,
+                    contour_blob,
+                    skeleton_blob,
+                    metadata_blob,
+                    template.similarity_threshold,
+                    template.id
+                ))
+                
+                # 删除旧的特征索引
+                cursor.execute('DELETE FROM feature_index WHERE template_id = ?', 
+                             (template.id,))
+                
+                # 添加新的特征索引
+                self._add_feature_index(cursor, template.id, template.features)
+                
+                conn.commit()
+                
+                # 更新缓存
+                self._template_cache[template.id] = template
+                
+                self.logger.info(f"Template updated: {template.name} (ID: {template.id})")
+                return True
+                
+        except Exception as e:
+            self.logger.error(f"Error updating template: {e}")
             return False
     
-    def get_statistics(self) -> Dict[str, Any]:
+    def delete_template(self, template_id: int) -> bool:
+        """
+        删除笔触模板
+        
+        Args:
+            template_id: 模板ID
+            
+        Returns:
+            是否成功
+        """
+        try:
+            with sqlite3.connect(self.database_path) as conn:
+                cursor = conn.cursor()
+                
+                # 删除特征索引
+                cursor.execute('DELETE FROM feature_index WHERE template_id = ?', 
+                             (template_id,))
+                
+                # 删除模板
+                cursor.execute('DELETE FROM stroke_templates WHERE id = ?', 
+                             (template_id,))
+                
+                conn.commit()
+                
+                # 清除缓存
+                if template_id in self._template_cache:
+                    del self._template_cache[template_id]
+                
+                self.logger.info(f"Template deleted: ID {template_id}")
+                return True
+                
+        except Exception as e:
+            self.logger.error(f"Error deleting template: {e}")
+            return False
+    
+    def get_categories(self) -> List[str]:
+        """
+        获取所有分类
+        
+        Returns:
+            分类列表
+        """
+        try:
+            with sqlite3.connect(self.database_path) as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute('SELECT DISTINCT category FROM stroke_templates')
+                rows = cursor.fetchall()
+                
+                return [row[0] for row in rows]
+                
+        except Exception as e:
+            self.logger.error(f"Error getting categories: {e}")
+            return []
+    
+    def get_template_count(self, category: str = None) -> int:
+        """
+        获取模板数量
+        
+        Args:
+            category: 分类过滤
+            
+        Returns:
+            模板数量
+        """
+        try:
+            with sqlite3.connect(self.database_path) as conn:
+                cursor = conn.cursor()
+                
+                if category:
+                    cursor.execute(
+                        'SELECT COUNT(*) FROM stroke_templates WHERE category = ?',
+                        (category,)
+                    )
+                else:
+                    cursor.execute('SELECT COUNT(*) FROM stroke_templates')
+                
+                return cursor.fetchone()[0]
+                
+        except Exception as e:
+            self.logger.error(f"Error getting template count: {e}")
+            return 0
+    
+    def create_template_from_stroke(self, stroke: Stroke, name: str, 
+                                  category: str) -> StrokeTemplate:
+        """
+        从笔触创建模板
+        
+        Args:
+            stroke: 笔触对象
+            name: 模板名称
+            category: 分类
+            
+        Returns:
+            笔触模板
+        """
+        # 提取骨架（简化实现）
+        skeleton = self._extract_skeleton_from_stroke(stroke)
+        
+        # 创建模板
+        template = StrokeTemplate(
+            id=0,  # 将在添加到数据库时设置
+            name=name,
+            category=category,
+            features=stroke.features.copy(),
+            contour=stroke.contour,
+            skeleton=skeleton,
+            metadata={
+                'source_stroke_id': stroke.id,
+                'area': stroke.area,
+                'perimeter': stroke.perimeter,
+                'length': stroke.length,
+                'width': stroke.width,
+                'angle': stroke.angle,
+                'confidence': stroke.confidence
+            }
+        )
+        
+        return template
+    
+    def batch_add_templates(self, templates: List[StrokeTemplate]) -> List[int]:
+        """
+        批量添加模板
+        
+        Args:
+            templates: 模板列表
+            
+        Returns:
+            模板ID列表
+        """
+        template_ids = []
+        
+        try:
+            with sqlite3.connect(self.database_path) as conn:
+                cursor = conn.cursor()
+                
+                for template in templates:
+                    # 序列化数据
+                    features_blob = pickle.dumps(template.features)
+                    contour_blob = pickle.dumps(template.contour)
+                    skeleton_blob = pickle.dumps(template.skeleton)
+                    metadata_blob = pickle.dumps(template.metadata)
+                    
+                    # 插入模板
+                    cursor.execute('''
+                        INSERT INTO stroke_templates 
+                        (name, category, features, contour, skeleton, metadata, similarity_threshold)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        template.name,
+                        template.category,
+                        features_blob,
+                        contour_blob,
+                        skeleton_blob,
+                        metadata_blob,
+                        template.similarity_threshold
+                    ))
+                    
+                    template_id = cursor.lastrowid
+                    template_ids.append(template_id)
+                    
+                    # 添加特征索引
+                    self._add_feature_index(cursor, template_id, template.features)
+                    
+                    # 更新缓存
+                    template.id = template_id
+                    self._template_cache[template_id] = template
+                
+                conn.commit()
+                self.logger.info(f"Batch added {len(templates)} templates")
+                
+        except Exception as e:
+            self.logger.error(f"Error batch adding templates: {e}")
+            raise
+        
+        return template_ids
+    
+    def clear_cache(self):
+        """清除缓存"""
+        self._template_cache.clear()
+        self._feature_cache.clear()
+        self.logger.info("Cache cleared")
+    
+    def get_database_stats(self) -> Dict[str, Any]:
         """
         获取数据库统计信息
         
         Returns:
-            Dict: 统计信息
-        """
-        stats = {
-            'total_templates': len(self.templates),
-            'categories': len(self.categories),
-            'category_distribution': {cat: len(ids) for cat, ids in self.categories.items()},
-            'database_size_mb': self._get_database_size(),
-            'last_updated': datetime.now().isoformat()
-        }
-        
-        return stats
-    
-    def save_database(self, path: str = None) -> bool:
-        """
-        保存数据库到文件
-        
-        Args:
-            path (str, optional): 保存路径
-            
-        Returns:
-            bool: 是否成功保存
+            统计信息字典
         """
         try:
-            if path is None:
-                path = self.database_path
-            else:
-                path = Path(path)
-            
-            # 确保目录存在
-            path.parent.mkdir(parents=True, exist_ok=True)
-            
-            # 准备保存数据
-            save_data = {
-                'templates': {},
-                'categories': self.categories,
-                'metadata': {
-                    'version': '1.0',
-                    'created_time': datetime.now().isoformat(),
-                    'total_templates': len(self.templates)
+            with sqlite3.connect(self.database_path) as conn:
+                cursor = conn.cursor()
+                
+                # 总模板数
+                cursor.execute('SELECT COUNT(*) FROM stroke_templates')
+                total_templates = cursor.fetchone()[0]
+                
+                # 分类统计
+                cursor.execute('''
+                    SELECT category, COUNT(*) 
+                    FROM stroke_templates 
+                    GROUP BY category
+                ''')
+                category_stats = dict(cursor.fetchall())
+                
+                # 数据库文件大小
+                db_size = Path(self.database_path).stat().st_size if Path(self.database_path).exists() else 0
+                
+                return {
+                    'total_templates': total_templates,
+                    'categories': category_stats,
+                    'database_size_bytes': db_size,
+                    'cache_size': len(self._template_cache)
                 }
-            }
-            
-            # 序列化模板数据
-            for template_id, template in self.templates.items():
-                save_data['templates'][template_id] = self._serialize_template(template)
-            
-            # 保存到文件
-            with open(path, 'wb') as f:
-                pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-            
-            self.logger.info(f"Database saved to {path}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error saving database: {str(e)}")
-            return False
-    
-    def load_database(self, path: str = None) -> bool:
-        """
-        从文件加载数据库
-        
-        Args:
-            path (str, optional): 加载路径
-            
-        Returns:
-            bool: 是否成功加载
-        """
-        try:
-            if path is None:
-                path = self.database_path
-            else:
-                path = Path(path)
-            
-            if not path.exists():
-                self.logger.info(f"Database file {path} not found, starting with empty database")
-                return True
-            
-            # 从文件加载
-            with open(path, 'rb') as f:
-                save_data = pickle.load(f)
-            
-            # 恢复数据
-            self.categories = save_data.get('categories', {})
-            
-            # 反序列化模板数据
-            template_data = save_data.get('templates', {})
-            for template_id, serialized_template in template_data.items():
-                template = self._deserialize_template(serialized_template)
-                if template:
-                    self.templates[template_id] = template
-            
-            # 重建特征索引
-            self._rebuild_feature_index()
-            
-            metadata = save_data.get('metadata', {})
-            self.logger.info(f"Database loaded from {path}, {len(self.templates)} templates")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error loading database: {str(e)}")
-            return False
-    
-    def export_templates(self, export_path: str, category: str = None) -> bool:
-        """
-        导出模板数据
-        
-        Args:
-            export_path (str): 导出路径
-            category (str, optional): 指定类别
-            
-        Returns:
-            bool: 是否成功导出
-        """
-        try:
-            export_path = Path(export_path)
-            export_path.mkdir(parents=True, exist_ok=True)
-            
-            # 确定导出的模板
-            if category:
-                template_ids = self.categories.get(category, [])
-            else:
-                template_ids = list(self.templates.keys())
-            
-            # 导出每个模板
-            for template_id in template_ids:
-                if template_id not in self.templates:
-                    continue
                 
-                template = self.templates[template_id]
-                
-                # 创建模板目录
-                template_dir = export_path / template_id
-                template_dir.mkdir(exist_ok=True)
-                
-                # 保存模板数据
-                template_file = template_dir / 'template.json'
-                with open(template_file, 'w', encoding='utf-8') as f:
-                    json.dump(self._template_to_dict(template), f, indent=2, ensure_ascii=False)
-                
-                # 保存数组数据
-                np.save(template_dir / 'skeleton.npy', template.skeleton)
-                np.save(template_dir / 'contour.npy', template.contour)
-                np.save(template_dir / 'width_profile.npy', template.width_profile)
-                np.save(template_dir / 'pressure_profile.npy', template.pressure_profile)
-                np.save(template_dir / 'velocity_profile.npy', template.velocity_profile)
-            
-            self.logger.info(f"Exported {len(template_ids)} templates to {export_path}")
-            return True
-            
         except Exception as e:
-            self.logger.error(f"Error exporting templates: {str(e)}")
-            return False
+            self.logger.error(f"Error getting database stats: {e}")
+            return {}
     
-    def _validate_template(self, template: StrokeTemplate) -> bool:
-        """
-        验证模板数据的有效性
-        
-        Args:
-            template (StrokeTemplate): 笔画模板
-            
-        Returns:
-            bool: 是否有效
-        """
-        try:
-            # 检查必要字段
-            if not template.id or not template.category:
-                return False
-            
-            # 检查数组数据
-            if (template.skeleton is None or len(template.skeleton) == 0 or
-                template.contour is None or len(template.contour) == 0):
-                return False
-            
-            # 检查特征数据
-            if not isinstance(template.features, dict):
-                return False
-            
-            return True
-            
-        except Exception:
-            return False
+    def _add_feature_index(self, cursor, template_id: int, features: Dict[str, Any]):
+        """添加特征索引"""
+        for feature_name, feature_value in features.items():
+            if isinstance(feature_value, (int, float)):
+                cursor.execute('''
+                    INSERT INTO feature_index (template_id, feature_name, feature_value)
+                    VALUES (?, ?, ?)
+                ''', (template_id, feature_name, float(feature_value)))
     
-    def _compute_similarity(self, features1: Dict[str, Any], features2: Dict[str, Any]) -> float:
-        """
-        计算两个特征向量的相似度
+    def _row_to_template(self, row) -> StrokeTemplate:
+        """将数据库行转换为模板对象"""
+        template_id, name, category, features_blob, contour_blob, \
+        skeleton_blob, metadata_blob, similarity_threshold = row
         
-        Args:
-            features1 (Dict): 特征向量1
-            features2 (Dict): 特征向量2
-            
-        Returns:
-            float: 相似度分数
-        """
-        try:
-            # 提取数值特征
-            numeric_features1 = self._extract_numeric_features(features1)
-            numeric_features2 = self._extract_numeric_features(features2)
-            
-            if len(numeric_features1) == 0 or len(numeric_features2) == 0:
-                return 0.0
-            
-            # 计算余弦相似度
-            dot_product = np.dot(numeric_features1, numeric_features2)
-            norm1 = np.linalg.norm(numeric_features1)
-            norm2 = np.linalg.norm(numeric_features2)
-            
-            if norm1 == 0 or norm2 == 0:
-                return 0.0
-            
-            similarity = dot_product / (norm1 * norm2)
-            return max(0.0, similarity)  # 确保非负
-            
-        except Exception:
-            return 0.0
+        # 反序列化数据
+        features = pickle.loads(features_blob)
+        contour = pickle.loads(contour_blob)
+        skeleton = pickle.loads(skeleton_blob)
+        metadata = pickle.loads(metadata_blob)
+        
+        return StrokeTemplate(
+            id=template_id,
+            name=name,
+            category=category,
+            features=features,
+            contour=contour,
+            skeleton=skeleton,
+            metadata=metadata,
+            similarity_threshold=similarity_threshold
+        )
     
-    def _extract_numeric_features(self, features: Dict[str, Any]) -> np.ndarray:
-        """
-        从特征字典中提取数值特征
-        
-        Args:
-            features (Dict): 特征字典
-            
-        Returns:
-            np.ndarray: 数值特征向量
-        """
-        numeric_values = []
-        
-        for key, value in features.items():
-            if isinstance(value, (int, float)):
-                numeric_values.append(float(value))
-            elif isinstance(value, np.ndarray) and value.size > 0:
-                if value.ndim == 1:
-                    numeric_values.extend(value.flatten())
-                else:
-                    numeric_values.extend(value.flatten()[:10])  # 限制长度
-        
-        return np.array(numeric_values) if numeric_values else np.array([])
-    
-    def _update_feature_index(self, template: StrokeTemplate):
-        """
-        更新特征索引
-        
-        Args:
-            template (StrokeTemplate): 笔画模板
-        """
-        try:
-            feature_vector = self._extract_numeric_features(template.features)
-            if len(feature_vector) > 0:
-                self.feature_index[template.id] = feature_vector
-        except Exception as e:
-            self.logger.warning(f"Error updating feature index for {template.id}: {str(e)}")
-    
-    def _remove_from_feature_index(self, template_id: str):
-        """
-        从特征索引中移除模板
-        
-        Args:
-            template_id (str): 模板ID
-        """
-        if template_id in self.feature_index:
-            del self.feature_index[template_id]
-    
-    def _rebuild_feature_index(self):
-        """
-        重建特征索引
-        """
-        self.feature_index.clear()
-        for template_id, template in self.templates.items():
-            self._update_feature_index(template)
-    
-    def _serialize_template(self, template: StrokeTemplate) -> Dict[str, Any]:
-        """
-        序列化模板数据
-        
-        Args:
-            template (StrokeTemplate): 笔画模板
-            
-        Returns:
-            Dict: 序列化数据
-        """
-        data = asdict(template)
-        
-        # 转换numpy数组为列表
-        for key in ['skeleton', 'contour', 'width_profile', 'pressure_profile', 'velocity_profile']:
-            if isinstance(data[key], np.ndarray):
-                data[key] = data[key].tolist()
-        
-        return data
-    
-    def _deserialize_template(self, data: Dict[str, Any]) -> Optional[StrokeTemplate]:
-        """
-        反序列化模板数据
-        
-        Args:
-            data (Dict): 序列化数据
-            
-        Returns:
-            StrokeTemplate: 笔画模板
-        """
-        try:
-            # 转换列表为numpy数组
-            for key in ['skeleton', 'contour', 'width_profile', 'pressure_profile', 'velocity_profile']:
-                if isinstance(data[key], list):
-                    data[key] = np.array(data[key])
-            
-            return StrokeTemplate(**data)
-            
-        except Exception as e:
-            self.logger.error(f"Error deserializing template: {str(e)}")
-            return None
-    
-    def _template_to_dict(self, template: StrokeTemplate) -> Dict[str, Any]:
-        """
-        将模板转换为字典（用于JSON导出）
-        
-        Args:
-            template (StrokeTemplate): 笔画模板
-            
-        Returns:
-            Dict: 字典数据
-        """
-        data = asdict(template)
-        
-        # 移除numpy数组（单独保存）
-        for key in ['skeleton', 'contour', 'width_profile', 'pressure_profile', 'velocity_profile']:
-            if key in data:
-                data[key] = f"{key}.npy"  # 引用文件名
-        
-        return data
-    
-    def _get_database_size(self) -> float:
-        """
-        获取数据库大小（MB）
-        
-        Returns:
-            float: 数据库大小
-        """
-        try:
-            if self.database_path.exists():
-                size_bytes = self.database_path.stat().st_size
-                return size_bytes / (1024 * 1024)  # 转换为MB
-            else:
-                return 0.0
-        except Exception:
-            return 0.0
+    def _extract_skeleton_from_stroke(self, stroke: Stroke) -> np.ndarray:
+        """从笔触提取骨架（简化实现）"""
+        # 这里应该使用更复杂的骨架提取算法
+        # 简化实现：返回轮廓的中心线
+        if len(stroke.contour) > 0:
+            points = stroke.contour.reshape(-1, 2)
+            # 简单地返回轮廓点作为骨架
+            return points[::2]  # 每隔一个点取样
+        else:
+            return np.array([[stroke.center[0], stroke.center[1]]])
