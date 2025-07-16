@@ -18,7 +18,7 @@
 
 ### 1. 克隆项目
 ```bash
-git clone https://github.com/your-username/Re_animatedDraw.git
+git clone https://github.com/zMaliu/Re_animatedDraw.git
 cd Re_animatedDraw
 ```
 
@@ -48,7 +48,6 @@ Re_animatedDraw/
 ├── utils/                 # 工具函数
 ├── config/                # 配置文件
 ├── data/                  # 输入数据
-├── models/               # 模型文件
 ├── output/               # 输出结果
 └── logs/                 # 日志文件
 ```
@@ -116,43 +115,9 @@ Re_animatedDraw/
 }
 ```
 
-## 开发状态
-
-- [x] 项目结构设计
-- [x] 核心组件架构
-- [x] 配置管理系统
-- [x] 日志系统
-- [x] 基础测试框架
-- [ ] 完整图像处理算法
-- [ ] 笔画检测算法
-- [ ] 骨架提取算法
-- [ ] 笔画库构建
-- [ ] 绘画顺序算法
-- [ ] 动画生成引擎
-- [ ] 用户界面
-- [ ] 性能优化
-
-## 贡献指南
-
-1. Fork 项目
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启 Pull Request
 
 ## 参考文献
 
 - Animated Construction of Chinese Brush Paintings (IEEE)
 - Animating Chinese paintings through stroke-based decomposition
 - Virtual brush: a model-based synthesis of Chinese calligraphy
-
-## 许可证
-
-本项目采用 MIT 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情
-
-## 联系方式
-
-如有问题或建议，欢迎提出 Issue 或通过以下方式联系：
-
-- 项目 Issue 页面: [GitHub Issues](https://github.com/your-username/Re_animatedDraw/issues)
-- 邮箱: your-email@example.com
