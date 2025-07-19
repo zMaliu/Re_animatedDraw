@@ -54,7 +54,7 @@
 ### 2. 安装步骤
 ```bash
 # 克隆项目
-git clone https://github.com/your-username/Re_animatedDraw.git
+git clone https://github.com/zMaliu/Re_animatedDraw.git
 cd Re_animatedDraw
 
 # 创建虚拟环境（推荐）
@@ -353,13 +353,6 @@ print(f"总能量: {total_energy}")
 }
 ```
 
-## 贡献指南
-
-1. Fork 项目
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启 Pull Request
 
 ## 参考文献
 
@@ -367,13 +360,3 @@ print(f"总能量: {total_energy}")
 - Animating Chinese paintings through stroke-based decomposition
 - Virtual brush: a model-based synthesis of Chinese calligraphy
 
-## 许可证
-
-本项目采用 MIT 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情
-
-## 联系方式
-
-如有问题或建议，欢迎提出 Issue 或通过以下方式联系：
-
-- 项目 Issue 页面: [GitHub Issues](https://github.com/your-username/Re_animatedDraw/issues)
-- 邮箱: your-email@example.com
