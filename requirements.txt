@@ -1,61 +1,10 @@
-# 核心依赖
-numpy>=1.21.0
-opencv-python>=4.5.0
-Pillow>=8.3.0
-scipy>=1.7.0
-
-# 图像处理和计算机视觉
+opencv-python>=4.8.0
+numpy>=1.24.0
+scipy>=1.10.0
+scikit-learn>=1.3.0
 scikit-image>=0.18.0
-scikit-learn>=1.0.0
-imageio>=2.9.0
-cairosvg>=2.5.0  # SVG支持
-svglib>=1.4.0    # SVG解析
-
-# 机器学习（可选，用于高级笔画分类）
-# tensorflow>=2.8.0
-# torch>=1.11.0
-# torchvision>=0.12.0
-
-# 数据处理
-pandas>=1.3.0
-
-# 可视化
-matplotlib>=3.4.0
-seaborn>=0.11.0
-plotly>=5.0.0
-
-# 视频处理和动画生成
-ffmpeg-python>=0.2.0
-imageio-ffmpeg>=0.4.0
-
-# 数据存储
-h5py>=3.1.0
-sqlalchemy>=1.4.0
-
-# 配置文件处理
-PyYAML>=5.4.0
-toml>=0.10.0
-
-# 性能监控和分析
-psutil>=5.8.0
-memory-profiler>=0.60.0
-
-# 数学计算
-sympy>=1.8.0
-numba>=0.56.0
-
-# 进度条和用户界面
-tqdm>=4.62.0
-
-# 日志
-coloredlogs>=15.0
-
-# 开发工具
-pytest>=6.2.0
-pytest-cov>=2.12.0
-black>=21.0.0
-flake8>=3.9.0
-
-# 文档生成（可选）
-# sphinx>=4.0.0
-# sphinx-rtd-theme>=0.5.0
+networkx>=3.1
+Pillow>=10.0.0
+matplotlib>=3.7.0
+pandas>=2.0.0
+tqdm>=4.65.0

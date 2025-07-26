@@ -1,0 +1,28 @@
+{
+  "processing_times": {
+    "stroke_extraction": 0.05641341209411621,
+    "feature_modeling": 1.2587320804595947,
+    "structure_construction": 0.4539947509765625,
+    "stroke_ordering": 13.766449928283691,
+    "animation_generation": 27.7476007938385,
+    "total": 43.283190965652466
+  },
+  "data_statistics": {
+    "stroke_count": 67,
+    "feature_count": 67,
+    "stage_distribution": {
+      "main_structure": 20,
+      "local_details": 26,
+      "decorative": 21
+    },
+    "optimization_length": 67,
+    "animation_fps": 24
+  },
+  "configuration": {
+    "input_image": "test.jpg",
+    "output_directory": "output",
+    "debug_mode": false,
+    "skip_nes": false,
+    "evaluation_enabled": false
+  }
+}
