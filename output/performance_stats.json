@@ -1,27 +1,27 @@
 {
   "processing_times": {
-    "stroke_extraction": 0.05641341209411621,
-    "feature_modeling": 1.2587320804595947,
-    "structure_construction": 0.4539947509765625,
-    "stroke_ordering": 13.766449928283691,
-    "animation_generation": 27.7476007938385,
-    "total": 43.283190965652466
+    "stroke_extraction": 0.03932666778564453,
+    "feature_modeling": 1.7904648780822754,
+    "structure_construction": 3.346238613128662,
+    "stroke_ordering": 69.1098530292511,
+    "animation_generation": 4.032202482223511,
+    "total": 78.31808567047119
   },
   "data_statistics": {
-    "stroke_count": 67,
-    "feature_count": 67,
+    "stroke_count": 128,
+    "feature_count": 128,
     "stage_distribution": {
-      "main_structure": 20,
-      "local_details": 26,
-      "decorative": 21
+      "main_structure": 38,
+      "local_details": 51,
+      "decorative": 39
     },
-    "optimization_length": 67,
+    "optimization_length": 128,
     "animation_fps": 24
   },
   "configuration": {
-    "input_image": "test.jpg",
+    "input_image": "2.jpg",
     "output_directory": "output",
-    "debug_mode": false,
+    "debug_mode": true,
     "skip_nes": false,
     "evaluation_enabled": false
   }

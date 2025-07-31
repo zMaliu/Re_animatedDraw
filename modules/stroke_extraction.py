@@ -18,6 +18,21 @@ from typing import List, Tuple, Dict, Optional
 from skimage import morphology
 import json
 
+
+class NumpyEncoder(json.JSONEncoder):
+    """自定义JSON编码器，用于处理numpy数据类型"""
+    
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        else:
+            return super(NumpyEncoder, self).default(obj)
+
+
 class Stroke:
     """笔触类，存储单个笔触的信息"""
     
@@ -225,7 +240,7 @@ class StrokeExtractor:
         }
         
         with open(output_dir / "stroke_info.json", 'w', encoding='utf-8') as f:
-            json.dump(stroke_info, f, indent=2, ensure_ascii=False)
+            json.dump(stroke_info, f, indent=2, ensure_ascii=False, cls=NumpyEncoder)
         
         print(f"调试图像已保存至: {output_dir}")
 
